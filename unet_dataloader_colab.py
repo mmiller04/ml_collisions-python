@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.optim as optim
 import timeit
 import h5py
-import torch.utils.data as data
+from torch.utils.data import Dataset, DataLoader, Subset 
 from scipy import stats
 from google.colab import files
 
@@ -178,7 +178,7 @@ net_i = Unet().to(device)
 
 class DistFuncDataset(Dataset):
     
-    def __init__(self, hf_f, hf_df, hf_vol:
+    def __init__(self, hf_f, hf_df, hf_vol):    
         self.hf_f = hf_f
         self.hf_df = hf_df
         self.hf_vol = hf_vol
@@ -228,13 +228,13 @@ def split_data(dataset, percentage_train):
   train_inds = inds[:num_train]
   test_inds = inds[num_train:]
   
-  trainset = data.Subset(dataset, train_inds)
-  testset = data.Subset(dataset, test_inds)
+  trainset = Subset(dataset, train_inds)
+  testset = Subset(dataset, test_inds)
   
-  trainloader = data.DataLoader(trainset, batch_size=batch_size,
+  trainloader = DataLoader(trainset, batch_size=batch_size,
                                 shuffle=True, pin_memory=True, num_workers=4)
   
-  testloader = data.DataLoader(testset, batch_size=batch_size,
+  testloader = DataLoader(testset, batch_size=batch_size,
                                shuffle=True, pin_memory=True, num_workers=4)
 
   return trainloader, testloader
@@ -420,3 +420,37 @@ def test(f_test,df_test,vol_test,net,device,cons_in,num_test):
             100*cons_error[2,:].max()))
     
     return l2_error, cons_error
+
+if __name__  == "__main__":
+    
+    start = timeit.default_timer()
+
+    print('Loading data')
+    load1 = timeit.default_timer()
+    dataset = load_data()
+    trainloader, testloader = split_data(dataset, percentage_train)
+    load2 = timeit.default_timer()
+    print('Finished loading - total loading time: {}s'.format(load2-load1))
+    
+    criterion = nn.MSELoss()
+    
+    optimizer = optim.SGD(net_i.parameters(), lr=lr, momentum=momentum)
+    scheduler = optim.lr_scheduler.StepLR(optimizer,step_size=step_size,gamma=lr_decay)
+    
+    print('Starting training')
+    train1 = timeit.default_timer()
+    loss_vector, cons_train = train(trainloader,0)
+    train2 = timeit.default_timer()
+    print('Finished training - total training time = {} hrs'.format((train2-train1)/3600))
+    
+    iterations=np.linspace(1,len(loss_vector),len(loss_vector))
+    plt.plot(iterations,loss_vector)
+    
+    print('Starting testing')
+    test1 = timeit.default.timer()
+    l2_error, cons_error, cons_test = test(testloader)
+    test2 = timeit.default.timer()
+    print('Finished testing - total testing time = {}s'.format(test2-test1))
+    
+    stop = timeit.default_timer()
+    print('Runtime: ' + str((stop-start)/3600) + 'hrs')
