@@ -172,8 +172,8 @@ class Unet(nn.Module):
        
         return logits
 
-net_e = Unet().to(device)
-net_i = Unet().to(device)
+net = Unet().to(device)
+#net_i = Unet().to(device)
 
 
 class DistFuncDataset(Dataset):
@@ -286,12 +286,16 @@ def check_properties(f_slice, vol, device):
             
     return mass, momentum, energy
 
-def train(trainloader,net,device,sp_flag,loss_vector,epoch,iphi,end):
+
+def train(trainloader,device,sp_flag):
   
     props_before = []
     props_after = []
-  
+    loss_vector = []
+    
     for epoch in range(num_epochs):
+      print('Epoch: {}'.format(epoch+1)) 
+      epoch1 = timeit.default_timer() 
       
       running_loss = 0.0
       for i, (data, targets, vol) in enumerate(trainloader):
@@ -332,49 +336,22 @@ def train(trainloader,net,device,sp_flag,loss_vector,epoch,iphi,end):
           running_loss += loss.item()
           if i % 1000 == 999:
               print('   [%d, %5d] loss: %.3f' %
-                    (epoch + 1, end + i + 1, running_loss / 1000))
+                    (epoch + 1, i + 1, running_loss / 1000))
               loss_vector.append(running_loss / 1000)
               running_loss = 0.0
-            
-      end += i + 1
-    
+      
+      epoch2 = timeit.default_timer()
+      print('Time for epoch {}: {}s'.format(epoch,epoch2-epoch1))
+      
     cons_array = np.concatenate((np.array(props_before),np.array(props_after)),axis=1)
     
-    return loss_vector, end, cons_array
+    return loss_vector, cons_array
 
 
-def conservation_before(f,vol,num_test,sp_flag,device):
-    
-    mass_in = []
-    momentum_in = []
-    energy_in = []
-
-    f = torch.from_numpy(f).to(device)
-    vol = torch.from_numpy(vol).to(device)
-
-    for n in range(num_test):
-      
-        mass, momentum, energy = check_properties(f[n,sp_flag,:,:-1],vol,device)
-                
-        mass_in.append(mass)         
-        momentum_in.append(momentum)         
-        energy_in.append(energy)         
-    
-    cons_in = np.array([mass_in, momentum_in, energy_in])
-    
-    return cons_in
-
-
-def test(f_test,df_test,vol_test,net,device,cons_in,num_test):
+def test(testloader):
   
-    testset = DistFuncDataset(f_test, df_test, vol_test)
-    
-    testloader = DataLoader(testset, batch_size=batch_size, 
-                            shuffle=True, num_workers=4)
-      
-    mass_out = []
-    momentum_out = []
-    energy_out = []
+    props_before = []
+    props_after = []
     
     l2_error=[]
     lt1=0
@@ -386,12 +363,9 @@ def test(f_test,df_test,vol_test,net,device,cons_in,num_test):
           
             outputs = net(data)
             outputs = outputs.to(device)
-                       
-            mass, momentum, energy = check_properties(outputs[:,0,:,:-1],vol,device)
-                
-            mass_out.append(mass)         
-            momentum_out.append(momentum)         
-            energy_out.append(energy) 
+            
+            props_before.append(check_properties(data[:,0,:,:-1],vol))          
+            props_after.append(check_properties(outputs[:,0,:,:-1],vol))
             
             loss = criterion(outputs, targets)
             l2_error.append(loss.item()*100)
@@ -400,17 +374,15 @@ def test(f_test,df_test,vol_test,net,device,cons_in,num_test):
             else:
                 gt1+=1
     
-    cons_out = np.array([mass_out, momentum_out, energy_out])
+    cons_array = np.concatenate((np.array(props_before),np.array(props_after)),axis=1)
 
-    num_error = len(cons_out[0])
+    num_error = len(cons_array)
     cons_error = np.zeros([3,num_error])
     
-    for c in range(num_error):
-        cons_error[0,c] += (cons_out[0,c] - cons_in[0,c])/cons_in[0,c]
-        cons_error[1,c] += (cons_out[1,c] - cons_in[1,c])/cons_in[1,c]
-        cons_error[2,c] += (cons_out[2,c] - cons_in[2,c])/cons_in[2,c]
-    
-    print('Finished testing')
+    cons_error[0] = (cons_array[:,3]-cons_array[:,0])/cons_array[:,0]
+    cons_error[1] = (cons_array[:,4]-cons_array[:,1])/cons_array[:,1]
+    cons_error[2] = (cons_array[:,5]-cons_array[:,2])/cons_array[:,2]
+
     print('Percentage with MSE<1: %d %%' % (
             100 * lt1/(lt1+gt1)))
     print('Percent error in conservation properties:\nmass: \
@@ -420,6 +392,7 @@ def test(f_test,df_test,vol_test,net,device,cons_in,num_test):
             100*cons_error[2,:].max()))
     
     return l2_error, cons_error
+
 
 if __name__  == "__main__":
     
@@ -434,7 +407,7 @@ if __name__  == "__main__":
     
     criterion = nn.MSELoss()
     
-    optimizer = optim.SGD(net_i.parameters(), lr=lr, momentum=momentum)
+    optimizer = optim.SGD(net.parameters(), lr=lr, momentum=momentum)
     scheduler = optim.lr_scheduler.StepLR(optimizer,step_size=step_size,gamma=lr_decay)
     
     print('Starting training')
