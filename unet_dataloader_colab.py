@@ -14,19 +14,19 @@ import torch.nn as nn
 import torch.optim as optim
 import timeit
 import h5py
-from torch.utils.data import Dataset, DataLoader, Subset 
+from torch.utils.data import Dataset, DataLoader, Subset
 from scipy import stats
 from google.colab import files
 
 batch_size = 32
 lr = 0.0005
 momentum = 0.99
-num_epochs = 10
+num_epochs = 1
 percentage_train = 0.85
 lr_decay = 0.01
 step_size = 1
 loss_weights = [1,1,1,1]
-nphi = 1
+nsp = 2
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -178,42 +178,80 @@ net = Unet().to(device)
 
 class DistFuncDataset(Dataset):
     
-    def __init__(self, hf_f, hf_df, hf_vol):    
-        self.hf_f = hf_f
-        self.hf_df = hf_df
-        self.hf_vol = hf_vol
+    def __init__(self, file1, file2, file3, file4):
+      
+        self.file1 = file1
+        self.file2 = file2
+        self.file3 = file3
+        self.file4 = file4
         
-        nphi,nperp,ngrid,npar = hf_f.get('i_f').shape
+        nphi,nperp,ngrid,npar = h5py.File(self.file1,'r').get('i_f').shape
         
         self.ngrid = ngrid
+        self.nperp = nperp
         self.nphi = nphi
+        self.npar = npar
         
     def __len__(self):
         return self.ngrid*self.nphi
      
     def __getitem__(self, index):
+        time1 = timeit.default_timer()
+        
+        hf_f = h5py.File(self.file1,'r')
+        hf_df = h5py.File(self.file2,'r')
+        hf_vol = h5py.File(self.file3,'r')
+        hf_stats = h5py.File(self.file4,'r')
+        
         iphi = index//self.ngrid         
         igrid = index - iphi*self.ngrid
                 
-        xi = self.hf_f['i_f'][iphi,:,igrid,:]
-        xe = self.hf_f['e_f'][iphi,:,igrid,:]
+        xi = hf_f['i_f'][iphi,:,igrid,:]
+        xe = hf_f['e_f'][iphi,:,igrid,:]
         
-        x = np.concatenate((np.expand_dims(xi,axis=0),np.expand_dims(xe,axis=0)),axis=0)     
-        y = self.hf_df['i_df'][iphi,:,igrid,:]
-        z = self.hf_vol['voli'][iphi,:,igrid]
+        time2 = timeit.default_timer()
+        y_part = hf_df['i_df'][iphi,:,igrid,:]
+        
+        time3 = timeit.default_timer()
+        x = np.empty([nsp,self.nperp,self.nperp])
+        y = np.empty([1,self.nperp,self.nperp])
+        
+        x[0,:,:-1] = xi
+        x[0,:,-1] = xi[:,-1]
+             
+        x[1,:,:-1] = xe
+        x[1,:,-1] = xe[:,-1]
+        
+        y[:,:,:-1] = y_part
+        y[:,:,-1] = y_part[:,-1]
+        
+        mean_f = hf_stats['mean_f'][...]
+        mean_df = hf_stats['mean_df'][...]
+        std_f = hf_stats['std_f'][...]
+        std_df = hf_stats['std_df'][...]
+        
+        x = (x - mean_f)/std_f
+        y = (y - mean_df[0])/std_df[0]
+        
+        time4 = timeit.default_timer()
+        z = hf_vol['voli'][iphi,:,igrid]
+        
+        #print(time2-time1,time3-time1,time4-time1)
+        
+        hf_f.close()
+        hf_df.close()
+        hf_vol.close()
             
         return x, y, z
     
 
 def load_data():
-
-  hf_f = h5py.File('/content/hdf5_data/hdf_f.h5','r')
-  hf_df = h5py.File('/content/hdf5_data/hdf_df.h5','r')
-  hf_vol = h5py.File('/content/hdf5_data/hdf_vol.h5','r')
-
-  #### NORMALIZATION !!!
   
-  dataset = DistFuncDataset(hf_f, hf_df, hf_vol)
+  file1 = '/content/hdf5_data/hdf_f.h5'
+  file2 = '/content/hdf5_data/hdf_df.h5'
+  file3 = '/content/hdf5_data/hdf_vol.h5'
+  
+  dataset = DistFuncDataset(file1, file2, file3)
 
   return dataset
 
@@ -232,15 +270,15 @@ def split_data(dataset, percentage_train):
   testset = Subset(dataset, test_inds)
   
   trainloader = DataLoader(trainset, batch_size=batch_size,
-                                shuffle=True, pin_memory=True, num_workers=4)
+                                shuffle=True, pin_memory=True, num_workers=8)
   
   testloader = DataLoader(testset, batch_size=batch_size,
-                               shuffle=True, pin_memory=True, num_workers=4)
+                               shuffle=True, pin_memory=True, num_workers=8)
 
   return trainloader, testloader
 
 
-def check_properties(f_slice, vol, device):
+def check_properties(f_slice, vol):
     
     f_slice = f_slice.double()
        
@@ -287,7 +325,7 @@ def check_properties(f_slice, vol, device):
     return mass, momentum, energy
 
 
-def train(trainloader,device,sp_flag):
+def train(trainloader,sp_flag):
   
     props_before = []
     props_after = []
@@ -298,10 +336,16 @@ def train(trainloader,device,sp_flag):
       epoch1 = timeit.default_timer() 
       
       running_loss = 0.0
+      timestart = timeit.default_timer()
       for i, (data, targets, vol) in enumerate(trainloader):
+          timeend = timeit.default_timer()
+          print(timeend-timestart)
+          print('before net')
+          print(i)
 
           data, targets, vol = data.to(device), targets.to(device), vol.to(device)
-
+          data, targets = data.float(), targets.float()
+          
           if sp_flag == 0:
               optimizer.zero_grad()
           else:
@@ -309,9 +353,9 @@ def train(trainloader,device,sp_flag):
 
           outputs = net(data)
           outputs = outputs.to(device)
-
-          mass_b,mom_b,energy_b = check_properties(data[:,0,:,:-1],vol,device)
-          mass_a,mom_a,energy_a = check_properties(outputs[:,0,:,:-1],vol,device)
+          print('after net')
+          mass_b,mom_b,energy_b = check_properties(data[:,0,:,:-1],vol)
+          mass_a,mom_a,energy_a = check_properties(outputs[:,0,:,:-1],vol)
 
           props_before.append([mass_b,mom_b,energy_b])
           props_after.append([mass_a,mom_a,energy_a])
@@ -319,27 +363,27 @@ def train(trainloader,device,sp_flag):
           mass_loss = abs((mass_a - mass_b)/mass_b)
           mom_loss = abs((mom_a - mom_b)/mom_b)
           energy_loss = abs((energy_a - energy_b)/energy_b)
-
+          print('after conservation')
           l2_loss = criterion(outputs, targets)
 
           loss = l2_loss*loss_weights[0] \
           + mass_loss*loss_weights[1] \
           + mom_loss*loss_weights[2] \
           + energy_loss*loss_weights[3]       
-
+          
           loss.backward()
           if sp_flag == 0:
               optimizer.step()
           else:
               optimizer_e.step()
-
+          print('after backprop')
           running_loss += loss.item()
-          if i % 1000 == 999:
-              print('   [%d, %5d] loss: %.3f' %
-                    (epoch + 1, i + 1, running_loss / 1000))
-              loss_vector.append(running_loss / 1000)
-              running_loss = 0.0
-      
+          #if i % 100 == 99:
+          #    print('   [%d, %5d] loss: %.3f' %
+          #          (epoch + 1, i + 1, running_loss / 100))
+          #    loss_vector.append(running_loss / 100)
+          #    running_loss = 0.0
+          timestart = timeit.default_timer()
       epoch2 = timeit.default_timer()
       print('Time for epoch {}: {}s'.format(epoch,epoch2-epoch1))
       
@@ -412,11 +456,12 @@ if __name__  == "__main__":
     
     print('Starting training')
     train1 = timeit.default_timer()
+    #%lprun -f DistFuncDataset.__getitem__ loss_vector, cons_train = train(trainloader,0)
     loss_vector, cons_train = train(trainloader,0)
     train2 = timeit.default_timer()
     print('Finished training - total training time = {} hrs'.format((train2-train1)/3600))
     
-    iterations=np.linspace(1,len(loss_vector),len(loss_vector))
+    iterations = np.linspace(1,len(loss_vector),len(loss_vector))
     plt.plot(iterations,loss_vector)
     
     print('Starting testing')
