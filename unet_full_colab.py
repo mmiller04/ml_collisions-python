@@ -20,14 +20,17 @@ from scipy import stats
 from google.colab import files
 
 batch_size = 32
-lr = 0.00005
+lr = 0.0005
 momentum = 0.99
 num_epochs = 10
-percentage_train = 0.85
+percentage_train = 0.8
+percentage_val = 0.1
 lr_decay = 0.01
 step_size = 2
 loss_weights = [1,0.5,0.5,0.5]
-nphi = 4
+nphi = 2
+output_rate = 1000
+val_rate = 2000
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -173,8 +176,8 @@ class Unet(nn.Module):
        
         return logits
 
-net_e = Unet().to(device)
-net_i = Unet().to(device)
+#net_e = Unet().to(device)
+net = Unet().to(device)
 
 
 def load_data_hdf(iphi):
@@ -202,43 +205,48 @@ def load_data_hdf(iphi):
     df[n,0,:,:-1] = i_df[:,n,:]
     df[n,1,:,:-1] = e_df[:,n,:]
 
-    f[n,0,:,-1]=i_f[:,n,-1]
-    f[n,1,:,-1]=e_f[:,n,-1]
-    df[n,0,:,-1]=i_df[:,n,-1]
-    df[n,1,:,-1]=e_df[:,n,-1]
+    f[n,0,:,-1] = i_f[:,n,-1]
+    f[n,1,:,-1] = e_f[:,n,-1]
+    df[n,0,:,-1] = i_df[:,n,-1]
+    df[n,1,:,-1] = e_df[:,n,-1]
     
     vol[n,0,:] = i_vol[:,n]
     vol[n,1,:] = e_vol[:,n]
 
   del i_f,e_f,i_df,e_df,i_vol,e_vol
+  
+  hf_stats = h5py.File('/content/hdf5_data/hdf_stats.h5','r')
     
-  std_f = np.empty([batch_size,2,ind1,ind1])
-  std_df = np.empty([batch_size,2,ind1,ind1])
-  mean_f = np.empty([batch_size,2,ind1,ind1])
-  mean_df = np.empty([batch_size,2,ind1,ind1])
+  std_f = hf_stats['std_f'][...]
+  std_df = hf_stats['std_df'][...]
+  mean_f = hf_stats['mean_f'][...]
+  mean_df = hf_stats['mean_df'][...]
 
-  for i in range(ind1):
-    for j in range(ind1):
-      f[:,0,i,j] = stats.zscore(f[:,0,i,j])
-      f[:,1,i,j] = stats.zscore(f[:,1,i,j])
-      df[:,0,i,j] = stats.zscore(df[:,0,i,j])
-      df[:,1,i,j] = stats.zscore(df[:,1,i,j])
-
-      std_f[:,0,i,j] = np.std(f[:,0,i,j])
-      std_f[:,1,i,j] = np.std(f[:,1,i,j])    
-      std_df[:,0,i,j] = np.std(df[:,0,i,j])
-      std_df[:,1,i,j] = np.std(df[:,1,i,j])
-
-      mean_f[:,0,i,j] = np.mean(f[:,0,i,j])
-      mean_f[:,1,i,j] = np.mean(f[:,1,i,j])    
-      mean_df[:,0,i,j] = np.mean(df[:,0,i,j])
-      mean_df[:,1,i,j] = np.mean(df[:,1,i,j])
-
-  std_f = torch.from_numpy(std_f).to(device).float()
-  std_df = torch.from_numpy(std_df).to(device).float()
+  mean_f[:,:,-1] = mean_f[:,:,-2]
+  mean_df[:,:,-1] = mean_df[:,:,-2]
+  std_f[:,:,-1] = std_f[:,:,-2]
+  std_df[:,:,-1] = std_df[:,:,-2]
+  
+  for n in range(ind2):
+    f[n] = (f[n]-mean_f)/std_f
+    df[n] = (df[n]-mean_df)/std_df
+    
+  mean_f = mean_f[np.newaxis]
+  mean_df = mean_df[np.newaxis]
+  std_f = std_f[np.newaxis]
+  std_df = std_df[np.newaxis]
+  
+  for i in range(int(np.ceil(np.log(batch_size)/np.log(2)))):
+    mean_f = np.concatenate((mean_f,mean_f),axis=0)
+    mean_df = np.concatenate((mean_df,mean_df),axis=0)
+    std_f = np.concatenate((std_f,std_f),axis=0)
+    std_df = np.concatenate((std_df,std_df),axis=0)  
+  
   mean_f = torch.from_numpy(mean_f).to(device).float()
   mean_df = torch.from_numpy(mean_df).to(device).float()
-    
+  std_f = torch.from_numpy(std_f).to(device).float()
+  std_df = torch.from_numpy(std_df).to(device).float()
+      
   return f,df,vol,ind2,std_f,std_df,mean_f,mean_df
 
 
@@ -263,40 +271,31 @@ class DistFuncDataset(Dataset):
     
 def split_data(f,df,vol,num_nodes):
     
-    # shuffle data up
-    #expand_df = np.expand_dims(df,axis=1)
-    #expand_vol = np.expand_dims(vol,axis=1)
-    #expand_vol = np.expand_dims(expand_vol,axis=3)
-    
-    #vol_ones = np.ones((num_nodes,1,len(vol[0,:]),len(vol[0,:])))
-    #expand_vol = vol_ones*expand_vol
-    
-    #del vol_ones
-    
-    #all_data = np.concatenate((f,expand_df,expand_vol),axis=1)
-    #np.random.shuffle(all_data)
-    
-    #f = all_data[:,:2,:,:]
-    #df = all_data[:,2,:,:]
-    #vol = all_data[:,3,:,0]
-    
-    #del all_data
+    inds = np.arange(num_nodes)
+    np.random.shuffle(inds) 
     
     num_train=int(np.floor(percentage_train*num_nodes))
-    num_test = num_nodes - num_train
+    num_val=int(np.floor(percentage_val*num_nodes))
     
-    f_train = f[:num_train,:,:,:]
-    f_test = f[num_train:,:,:,:]
+    train_inds = inds[:num_train]
+    val_inds = inds[num_train:num_train+num_val]
+    test_inds = inds[num_train+num_val:]
+ 
+    f_train = f[train_inds]
+    f_val = f[val_inds]
+    f_test = f[test_inds]
         
     del f  
       
-    df_train = df[:num_train,:,:]
-    df_test = df[num_train:,:,:]
+    df_train = df[train_inds]
+    df_val = df[val_inds]
+    df_test = df[test_inds]
     
     del df
     
-    vol_train = vol[:num_train,:]
-    vol_test = vol[num_train:,:]
+    vol_train = vol[train_inds]
+    vol_val = vol[val_inds]
+    vol_test = vol[test_inds]
     
     del vol
     
@@ -307,7 +306,12 @@ def split_data(f,df,vol,num_nodes):
     
     del f_train, df_train, vol_train
     
-    return trainloader, f_test, df_test, vol_test, num_train, num_test
+    valset = DistFuncDataset(f_val, df_val, vol_val)
+    
+    valloader = DataLoader(valset, batch_size=batch_size, 
+                                shuffle=True, pin_memory=True, num_workers=4)
+    
+    return trainloader, valloader, f_test, df_test, vol_test
 
 
 def check_properties(f_slice, vol):
@@ -346,26 +350,24 @@ def check_properties(f_slice, vol):
     mass_array = vol_array
     mom_array = vpar_array*vol_array
     energy_array = (vpar_array**2 + vperp_array**2)*vol_array
-    
+        
     mass_array, mom_array, energy_array = \
     mass_array.to(device), mom_array.to(device), energy_array.to(device)
-    
+
     mass = (torch.sum(f_slice*mass_array).float())/nbatch
     momentum = (torch.sum(f_slice*mom_array).float())/nbatch
     energy = (torch.sum(f_slice*energy_array).float())/nbatch
-            
+                
     return mass, momentum, energy
 
 
-def train(trainloader,net,device,sp_flag,loss_vector,epoch,iphi,end,std_f,std_df,mean_f,mean_df):
+def train(trainloader,valloader,sp_flag,epoch,end,std_f,std_df,mean_f,mean_df):
   
-    mass_before=[]
-    mass_after=[]
-    mom_before=[]
-    mom_after=[]
-    energy_before=[]
-    energy_after=[]
-  
+    props_before = []
+    props_after = []
+    train_loss_vector = []
+    val_loss_vector = []
+    
     running_loss = 0.0
     timestart = timeit.default_timer()
     for i, (data, targets, vol) in enumerate(trainloader):
@@ -382,35 +384,47 @@ def train(trainloader,net,device,sp_flag,loss_vector,epoch,iphi,end,std_f,std_df
         outputs = net(data)
         outputs = outputs.to(device)
         
+        if i % val_rate == 0:         
+          val_loss = validate(valloader)
+          val_loss_vector.append(val_loss)
+        
+        is_best = False
+        if val_loss < np.min(val_loss_vector): ## check this
+          is_best = True 
+          
+        if i % 2*val_rate == 0:
+          save_checkpoint({
+                           'epoch': epoch+1,
+                           'state_dict': net.state_dict(),
+                           'val_loss': val_loss,
+                           'optimizer': optimizer.state_dict(),
+                           }, is_best)
+                  
         if len(data) != batch_size:
           limit = len(data)
-          data = data*std_f[:limit] + mean_f[:limit]
-          outputs = outputs*std_df[:limit,0] + mean_df[:limit,0]
+          data_unnorm = data*std_f[:limit] + mean_f[:limit]
+          outputs_unnorm = outputs*std_df[:limit,0] + mean_df[:limit,0]
         
         else:
-          data = data*std_f + mean_f
-          outputs = outputs*std_df[:,0] + mean_df[:,0]
+          data_unnorm = data*std_f + mean_f
+          outputs_unnorm = outputs*std_df[:,0] + mean_df[:,0]
 
-        mass_b,mom_b,energy_b = check_properties(data[:,0,:,:-1],vol)
-        mass_a,mom_a,energy_a = check_properties(outputs[:,0,:,:-1],vol)
-        
-        mass_before.append(mass_b)
-        mass_after.append(mass_a)
-        mom_before.append(mom_b)
-        mom_after.append(mom_a)                
-        energy_before.append(energy_b)
-        energy_after.append(energy_a)
+        mass_b,mom_b,energy_b = check_properties(data_unnorm[:,0,:,:-1],vol)
+        mass_a,mom_a,energy_a = check_properties(outputs_unnorm[:,0,:,:-1],vol)
+                
+        props_before.append([mass_b,mom_b,energy_b])
+        props_after.append([mass_a,mom_a,energy_a])
 
-        mass_loss = np.abs((mass_a - mass_b)/mass_b)
-        mom_loss = np.abs((mom_a - mom_b)/mom_b)
-        energy_loss = np.abs((energy_a - energy_b)/energy_b)
+        mass_loss = torch.abs((mass_a - mass_b)/mass_b)
+        mom_loss = torch.abs((mom_a - mom_b)/mom_b)
+        energy_loss = torch.abs((energy_a - energy_b)/energy_b)
 
         l2_loss = criterion(outputs, targets)
 
         loss = l2_loss*loss_weights[0] \
-        + mass_loss*loss_weights[1] \
-        + mom_loss*loss_weights[2] \
-        + energy_loss*loss_weights[3]       
+             + mass_loss*loss_weights[1] \
+             + mom_loss*loss_weights[2] \
+             + energy_loss*loss_weights[3]       
 
         loss.backward()
         if sp_flag == 0:
@@ -419,70 +433,73 @@ def train(trainloader,net,device,sp_flag,loss_vector,epoch,iphi,end,std_f,std_df
             optimizer_e.step()
 
         running_loss += loss.item()
-        if i % 1000 == 999:
+        if i % output_rate == output_rate-1:
             print('   [%d, %5d] loss: %.3f' %
-                  (epoch + 1, end + i + 1, running_loss / 1000))
-            loss_vector.append(running_loss / 1000)
+                  (epoch + 1, end + i + 1, running_loss / output_rate))
+            train_loss_vector.append(running_loss / output_rate)
             running_loss = 0.0
         
         timestart = timeit.default_timer()  
     end += i + 1
     
-    cons_array = np.array([mass_before,mass_after,mom_before,mom_after,energy_before,energy_after])
+    cons_array = np.concatenate((np.array(props_before),np.array(props_after)),axis=1)
     
-    return loss_vector, end, cons_array
+    return train_loss_vector, val_loss_vector, cons_array, end
 
 
-def conservation_before(f,vol,num_test,sp_flag,device):
-    
-    mass_in = []
-    momentum_in = []
-    energy_in = []
-
-    f = torch.from_numpy(f).to(device)
-    vol = torch.from_numpy(vol).to(device)
-
-    for n in range(num_test):
+def validate(valloader):
+  
+  loss = 0
+  
+  with torch.no_grad():
+    for (data, targets, vol) in valloader:
       
-        mass, momentum, energy = check_properties(f[n,sp_flag,:,:-1],vol,device)
-                
-        mass_in.append(mass)         
-        momentum_in.append(momentum)         
-        energy_in.append(energy)         
-    
-    cons_in = np.array([mass_in, momentum_in, energy_in])
-    
-    return cons_in
+      data, targets, vol = data.to(device), targets.to(device), vol.to(device)
+      
+      outputs = net(data)
+      outputs = outputs.to(device)
+      
+      mass_b,mom_b,energy_b = check_properties(data[:,0,:,:-1],vol)
+      mass_a,mom_a,energy_a = check_properties(outputs[:,0,:,:-1],vol)
+
+      mass_loss = torch.abs((mass_a - mass_b)/mass_b)
+      mom_loss = torch.abs((mom_a - mom_b)/mom_b)
+      energy_loss = torch.abs((energy_a - energy_b)/energy_b)     
+      
+      l2_loss = criterion(outputs, targets)
+      
+      loss += l2_loss*loss_weights[0] \
+            + mass_loss*loss_weights[1] \
+            + mom_loss*loss_weights[2] \
+            + energy_loss*loss_weights[3]      
+
+      return loss
 
 
-def test(f_test,df_test,vol_test,net,device,cons_in,num_test):
+def test(f_test,df_test,vol_test):
   
     testset = DistFuncDataset(f_test, df_test, vol_test)
     
     testloader = DataLoader(testset, batch_size=batch_size, 
                             shuffle=True, num_workers=4)
       
-    mass_out = []
-    momentum_out = []
-    energy_out = []
+    props_before = []
+    props_after = []
     
     l2_error=[]
     lt1=0
     gt1=0
     with torch.no_grad():
-        for i, (data, targets, vol) in enumerate(testloader):
-            print(i)            
+        for (data, targets, vol) in testloader:
+
             data, targets, vol = data.to(device), targets.to(device), vol.to(device)
           
             outputs = net(data)
             outputs = outputs.to(device)
                        
-            mass, momentum, energy = check_properties(outputs[:,0,:,:-1],vol,device)
-                
-            mass_out.append(mass)         
-            momentum_out.append(momentum)         
-            energy_out.append(energy) 
-            
+            props_before.append(check_properties(data[:,0,:,:-1],vol))          
+            props_after.append(check_properties(outputs[:,0,:,:-1],vol))
+
             loss = criterion(outputs, targets)
             l2_error.append(loss.item()*100)
             if loss.item()*100 < 1:
@@ -490,37 +507,44 @@ def test(f_test,df_test,vol_test,net,device,cons_in,num_test):
             else:
                 gt1+=1
     
-    cons_out = np.array([mass_out, momentum_out, energy_out])
+    cons_array = np.concatenate((np.array(props_before),np.array(props_after)),axis=1)
 
-    num_error = len(cons_out[0])
+    num_error = len(cons_array)
     cons_error = np.zeros([3,num_error])
     
-    for c in range(num_error):
-        cons_error[0,c] += np.abs((cons_out[0,c] - cons_in[0,c])/cons_in[0,c])
-        cons_error[1,c] += np.abs((cons_out[1,c] - cons_in[1,c])/cons_in[1,c])
-        cons_error[2,c] += np.abs((cons_out[2,c] - cons_in[2,c])/cons_in[2,c])
+    cons_error[0] = torch.abs((cons_array[:,3]-cons_array[:,0])/cons_array[:,0])
+    cons_error[1] = torch.abs((cons_array[:,4]-cons_array[:,1])/cons_array[:,1])
+    cons_error[2] = torch.abs((cons_array[:,5]-cons_array[:,2])/cons_array[:,2])
     
     print('Finished testing')
     print('Percentage with MSE<1: %d %%' % (
             100 * lt1/(lt1+gt1)))
     print('Percent error in conservation properties:\nmass: \
             %d %%\nmomentum: %d %%\nenergy: %d %%' % ( 
-            100*cons_error[0,:].max(), 
-            100*cons_error[1,:].max(), 
-            100*cons_error[2,:].max()))
+            100*cons_error[0].max(), 
+            100*cons_error[1].max(), 
+            100*cons_error[2].max()))
     
     return l2_error, cons_error
 
 
-if __name__ == "__main__":
+def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'): 
+  torch.save(state,filename)
+  if is_best:
+    shutil.copy(filename, 'model_best.pth.tar')
+
+
+if __name__ == '__main__':
     
     start = timeit.default_timer()
     criterion = nn.MSELoss()
     
-    optimizer = optim.SGD(net_i.parameters(), lr=lr, momentum=momentum)
+    optimizer = optim.SGD(net.parameters(), lr=lr, momentum=momentum)
     scheduler = optim.lr_scheduler.StepLR(optimizer,step_size=step_size,gamma=lr_decay)
     
-    loss_vector=[]
+    train_loss = []
+    val_loss = []
+    
     for epoch in range(num_epochs):
       print('Epoch: {}'.format(epoch+1)) 
       
@@ -536,7 +560,7 @@ if __name__ == "__main__":
         print('      Loading time: {}s'.format(load2-load1))
     
         print('   Creating training set')
-        trainloader,f_test,df_test,vol_test,num_train,num_test = split_data(f,df[:,0,:,:],vol[:,0,:],num_nodes)
+        trainloader,valloader,f_test,df_test,vol_test = split_data(f,df[:,0,:,:],vol[:,0,:],num_nodes)
         del f,df,vol
         
         train1 = timeit.default_timer()
@@ -547,8 +571,8 @@ if __name__ == "__main__":
             del f_test,df_test,vol_test
     
             print('   Starting training')
-            loss_vector, end, cons_array = train(trainloader,net_i,device,0,loss_vector,epoch,iphi,end,\
-                                                std_f,std_df,mean_f,mean_df)
+            train_loss, val_loss, cons_array, end = train(trainloader,valloader,0,epoch,end,\
+                                                          std_f,std_df,mean_f,mean_df)
     
           else:
             f_all_test = np.vstack((f_all_test,f_test))
@@ -557,35 +581,45 @@ if __name__ == "__main__":
             del f_test,df_test,vol_test
     
             print('   Starting training')
-            loss_vector, end, cons_to_cat = train(trainloader,net_i,device,0,loss_vector,epoch,iphi,end,\
-                                                 std_f,std_df,mean_f,mean_df)
+            train_loss_to_app, val_loss_to_app, cons_to_cat, end = train(trainloader,valloader,0,epoch,end,\
+                                                                         std_f,std_df,mean_f,mean_df)
     
+            for loss1 in train_loss_to_app:
+              train_loss.append(loss1)
+            for loss2 in val_loss_to_app:
+              val_loss.append(loss2)
             cons_array = np.concatenate((cons_array, cons_to_cat), axis=1)
         
         else:
           del f_test,df_test,vol_test
           print('   Starting training')
-          loss_vector, end, cons_to_cat = train(trainloader,net_i,device,0,loss_vector,epoch,iphi,end,\
-                                               std_f,std_df,mean_f,mean_df)
-    
+          train_loss_to_app, val_loss_to_app, cons_to_cat, end = train(trainloader,valloader,0,epoch,end,\
+                                                                       std_f,std_df,mean_f,mean_df)
+          
+          for loss1 in train_loss_to_app:
+              train_loss.append(loss1)          
+          for loss2 in val_loss_to_app:
+              val_loss.append(loss2)      
           cons_array = np.concatenate((cons_array, cons_to_cat), axis=1)
-        
+             
         train2 = timeit.default_timer()
         print('Finished tranining iphi = {}'.format(iphi))
         print('   Training time for iphi = {}: {}s'.format(iphi,train2-train1))
-        
+      
+      train_iterations = np.linspace(1,len(train_loss),len(train_loss))
+      val_iterations = np.linspace(1,len(train_loss),len(val_loss))
+      
+      plt.plot(train_iterations,train_loss,'o',color='blue')
+      plt.plot(val_iterations,val_loss,'o',color='orange')
+      plt.show()
+      
       epoch2 = timeit.default_timer()
       scheduler.step()
       print('Epoch time: {}s\n'.format(epoch2-epoch1))
     
-    iterations=np.linspace(1,len(loss_vector),len(loss_vector))
-    plt.plot(iterations,loss_vector)
+    print('Starting testing')
+    l2_error_i, cons_error_i = test(f_all_test,df_all_test,vol_all_test)
+    print('Finished testing')
     
-    #print('Calculating conservation properties')
-    #cons_in = conservation_before(f_all_test,vol_all_test,num_test,0,device)
-    #print('Starting testing')
-    #l2_error_i, cons_error_i = test(f_all_test,df_all_test,vol_all_test,net_i,device,consi_in,num_test)
-    #print('Finished testing')
-    
-    #stop = timeit.default_timer()
-    #print('Runtime: ' + str((stop-start)/3600) + 'hrs')
+    stop = timeit.default_timer()
+    print('Runtime: ' + str((stop-start)/3600) + 'hrs')
