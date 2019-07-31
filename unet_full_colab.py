@@ -327,8 +327,8 @@ def check_properties(f_slice, vol):
     f0_smu_max = 4
     f0_vp_max = 4
     
-    vpar = np.linspace(0,f0_smu_max,npar) # 2*f0_nvp + 1
-    vperp = np.linspace(-f0_vp_max,f0_vp_max,nperp) # f0_nmu + 1
+    vpar = np.linspace(-f0_vp_max,f0_vp_max,npar) # 2*f0_nvp + 1
+    vperp = np.linspace(0,f0_smu_max,nperp) # f0_nmu + 1
     
     vpar = torch.tensor(vpar).double().to(device)
     vperp = torch.tensor(vperp).double().to(device)
