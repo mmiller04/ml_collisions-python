@@ -9,14 +9,14 @@ Original file is located at
 # from cloud
 """
 
-# from google.colab import auth
-# auth.authenticate_user()
+from google.colab import auth
+auth.authenticate_user()
 
-# project_id = 'peaceful-impact-247117'
-# bucket_name = 'ml_collisions-data1'
+project_id = 'peaceful-impact-247117'
+bucket_name = 'ml_collisions-data1'
 
-# !gcloud config set project {project_id}
-# !gsutil -m cp -r gs://ml-collisions-data1/hdf5_data/ /content/
+!gcloud config set project {project_id}
+!gsutil -m cp -r gs://ml-collisions-data1/hdf5_data/ /content/
 
 """# set vars"""
 
@@ -36,18 +36,18 @@ from torch.autograd import Variable
 
 batch_size = 32
 lr = 1e-5
-!mkdir /content/checkpoints/1e-4
+# !mkdir /content/checkpoints/1e-4
 momentum = 0.99
 num_epochs = 5
 percentage_train = 0.8
 percentage_val = 0.1
 lr_decay = 0.1
 step_size = 2
-loss_weights = [1,1e0,1e21,1e15]
-#loss_weights = [1,0,0,0]
+# loss_weights = [1,1e0,1e21,1e15]
+loss_weights = [1,1,1e-2,1]
 nphi = 1
 plot_rate = 250
-output_rate = 500
+output_rate = 200
 val_rate = 2000
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -164,7 +164,7 @@ class Unet(nn.Module):
                                   )
         
         self.logit_conv = nn.Conv2d(
-                                    in_channels=64, out_channels=1, kernel_size=1,
+                                    in_channels=64, out_channels=2, kernel_size=1,
                                     )
         
         
@@ -1006,26 +1006,28 @@ class conservation_variables():
     
     self.temp = hf_cons['f0_T_ev'][...]
     self.vol = np.zeros([self.temp.shape[0],self.f0_nmu+1,self.temp.shape[1]])
-    self.vol[0] = hf_vol['voli'][0]
-    self.vol[1] = hf_vol['vole'][0]
+    self.vol[0] = hf_vol['vole'][0]
+    self.vol[1] = hf_vol['voli'][0]
 
 class DistFuncDataset(Dataset):
 
-    def __init__(self, f_array, df_array, vol_array):
+    def __init__(self, f_array, df_array, temp_array, vol_array):
         self.data = torch.from_numpy(f_array).float()
         self.target = torch.from_numpy(df_array).float()
+        self.temp = torch.from_numpy(temp_array).float()
         self.vol = torch.from_numpy(vol_array).float()
         
     def __len__(self):
         return len(self.data)
       
     def __getitem__(self, index):
-        x = self.data[index]
-        y = self.target[index]
-        y = y.view(-1,32,32)
-        z = self.vol[index]
+        a = self.data[index]
+        b = self.target[index]
+        b = b.view(-1,32,32)
+        c = self.temp[index]
+        d = self.vol[index]
             
-        return x, y, z
+        return a, b, c, d
 
 """# split data"""
 
@@ -1035,8 +1037,8 @@ def split_data(f,df,cons,num_nodes):
     #np.random.seed(0)
     np.random.shuffle(inds) 
     
-    num_train=int(np.floor(percentage_train*num_nodes))
-    num_val=int(np.floor(percentage_val*num_nodes))
+    num_train = int(np.floor(percentage_train*num_nodes))
+    num_val = int(np.floor(percentage_val*num_nodes))
     
     train_inds = inds[:num_train]
     val_inds = inds[num_train:num_train+num_val]
@@ -1055,14 +1057,14 @@ def split_data(f,df,cons,num_nodes):
     del df
         
     # temperature and volume separate arrays here
-    temp = torch.einsum('ij -> ji', cons.temp)   
+    temp = np.einsum('ij -> ji', cons.temp)   
     temp_train = temp[train_inds]
     temp_val = temp[val_inds]
     temp_test = temp[test_inds]
     
     del temp
     
-    vol = torch.einsum('ijk -> kji', cons.vol)
+    vol = np.einsum('ijk -> kji', cons.vol)
     vol_train = vol[train_inds]
     vol_val = vol[val_inds]
     vol_test = vol[test_inds]
@@ -1087,7 +1089,7 @@ def split_data(f,df,cons,num_nodes):
 # same procedure as col_f_convergence_eval
 def check_properties_each(f_slice, cons, temp, vol, sp):
     
-    f_slice = f_slice.double()
+    f_slice = f_slice.float()
        
     if len(f_slice.shape) == 2:
       nperp, npar = f_slice.shape
@@ -1095,30 +1097,37 @@ def check_properties_each(f_slice, cons, temp, vol, sp):
     elif len(f_slice.shape) == 3:  
       nbatch,nperp,npar = f_slice.shape
       
-    vth = np.sqrt(temp*cons.sml_ev2j/cons.ptl_mass[sp]) 
+    vth = torch.sqrt(temp*cons.sml_ev2j/cons.ptl_mass[sp]) 
     
     vpar = np.linspace(-cons.f0_nvp,cons.f0_nvp,2*cons.f0_nvp+1)*cons.f0_dvp
     vperp = np.linspace(0,cons.f0_nmu,cons.f0_nmu+1)*cons.f0_dsmu
     
     vpar = torch.tensor(vpar).float().to(device)
     vperp = torch.tensor(vperp).float().to(device)
+    
+    mass = cons.ptl_mass[sp]
+    conv_factor_notemp = 1/np.sqrt((2*np.pi*cons.sml_ev2j/mass)**3)
+    temp_factor = 1/torch.sqrt(temp)
+    
+    smu_n = cons.f0_dsmu/3 # smu_n = f0_dsmu/f0_mu0_factor, f0_mu0_factor = 3
+    f_slice_norm = torch.einsum('ijk,i -> ijk',f_slice,temp_factor)*conv_factor_notemp/smu_n
       
     ones_tensor = torch.ones(nbatch,nperp,npar).float().to(device)
-    
+      
     vol_tensor = torch.einsum('ijk,ij -> ijk',ones_tensor,vol)
     vperp_tensor = torch.einsum('ijk,i,j -> ijk',ones_tensor,vth,vperp)
     vpar_tensor = torch.einsum('ijk,i,k -> ijk',ones_tensor,vth,vpar)
     
     mass_tensor = vol_tensor
     mom_tensor = vpar_tensor*vol_tensor*cons.ptl_mass[sp]
-    energy_tensor = (vpar_tensor**2 + vperp_tensor**2)*vol_tensor*cons.ptl_mass[sp]
+    energy_tensor = (vpar_tensor**2 + vperp_tensor**2)*cons.ptl_mass[sp]*vol_tensor
         
-    mass_array, mom_array, energy_array = \
-    mass_array.to(device), mom_array.to(device), energy_array.to(device)
-
-    mass = torch.sum(f_slice*mass_tensor, dim = (1,2))
-    momentum = torch.sum(f_slice*mom_tensor, dim = (1,2))
-    energy = torch.sum(f_slice*energy_tensor, dim = (1,2))
+    mass_tensor, mom_tensor, energy_tensor = \
+    mass_tensor.to(device), mom_tensor.to(device), energy_tensor.to(device) 
+            
+    mass = torch.sum(f_slice_norm*mass_tensor, dim = (1,2))
+    momentum = torch.sum(f_slice_norm*mom_tensor, dim = (1,2))
+    energy = torch.sum(f_slice_norm*energy_tensor, dim = (1,2))
                 
     return mass, momentum, energy
 
@@ -1126,23 +1135,23 @@ def check_properties_each(f_slice, cons, temp, vol, sp):
 # computes more useful quantities as in col_f_core_m after the calls to col_f_convergence_eval 
 def check_properties_main(f,df,temp,vol,cons):
   
-  masse = cons.ptl_mass[0]
-  massi = cons.ptl_mass[1]
+  masse = torch.from_numpy(np.array([cons.ptl_mass[0]])).to(device).float()
+  massi = torch.from_numpy(np.array([cons.ptl_mass[1]])).to(device).float()
   
-  dne,dpe,dwe = check_properties_each(df[:,0],cons,temp[0],vol[0],0)
-  dni,dpi,dwi = check_properties_each(df[:,1],cons,temp[1],vol[1],1)
+  dne,dpe,dwe = check_properties_each(df[:,0],cons,temp[:,0],vol[:,:,0],0)
+  dni,dpi,dwi = check_properties_each(df[:,1],cons,temp[:,1],vol[:,:,1],1)
   
-  ni,momi,eni = check_properties_each(f[:,0],cons,temp[0],vol[0],0)
-  ne,mome,ene = check_properties_each(f[:,0],cons,temp[1],vol[1],1)
-  
-  dni_n = torch.abs(dni/ni)
+  ne,mome,ene = check_properties_each(f[:,0],cons,temp[:,0],vol[:,:,0],0)
+  ni,momi,eni = check_properties_each(f[:,1],cons,temp[:,1],vol[:,:,1],1) 
+      
   dne_n = torch.abs(dne/ne)
+  dni_n = torch.abs(dni/ni)
   
   dp_p = torch.abs(dpi + dpe)/torch.max(torch.abs(momi + mome),1e-3*torch.max(massi,masse)*ne)
-
-  dw_w = torch.abs(dwi + dwe)/(eni + ene)
   
-  return dni_n,dne_n,dp_p,dw_w
+  dw_w = torch.abs(dwi + dwe)/(eni + ene)
+    
+  return dne_n,dni_n,dp_p,dw_w
 
 """# train"""
 
@@ -1172,33 +1181,42 @@ def train(trainloader,valloader,sp_flag,epoch,end,zvars,cons):
 
         outputs = net(data)
         outputs = outputs.to(device)
-                
+        
         nbatch = len(data)     
-        data_unnorm = data*zvars.std_f[:nbatch] + zvars.mean_f[:nbatch]
-        targets_unnorm = targets*zvars.std_df[:nbatch,0] + zvars.mean_df[:nbatch,0]
-        outputs_unnorm = outputs*zvars.std_df[:nbatch,0] + zvars.mean_df[:nbatch,0]
-          
-        targets_nof = targets_unnorm - data_unnorm[:,0,:,:]
-        outputs_nof = outputs_unnorm - data_unnorm[:,0,:,:]
-          
-        # updated calls to check_properties with correct arguments  
-        mass_b,mom_b,energy_b = check_properties_main(data_unnorm[:,:,:,:-1],\
-                                                 targets_nof[:,:,:,:-1],temp,vol,cons) 
-        mass_a,mom_a,energy_a = check_properties_main(data_unnorm[:,:,:,:-1],\
-                                                 outputs_nof[:,:,:,:-1],temp,vol,cons)
 
-        props_before.append([(torch.sum(mass_b)/nbatch).item(),\
+        data_unnorm = data*zvars.std_f[:nbatch] + zvars.mean_f[:nbatch]
+        targets_unnorm = targets*zvars.std_df[:nbatch] + zvars.mean_df[:nbatch]
+        outputs_unnorm = outputs[:nbatch,0]*zvars.std_df[:nbatch,1] + zvars.mean_df[:nbatch,1]
+                   
+        targets_nof = targets_unnorm - data_unnorm
+        outputs_nof = outputs_unnorm[:nbatch] - data_unnorm[:nbatch,1]
+        
+        # concatenate with actual dfe
+        outputs_nof = torch.cat((targets_nof[:nbatch,0].unsqueeze(1),outputs_nof[:nbatch].unsqueeze(1)),1)
+                  
+        # updated calls to check_properties with correct arguments  
+        masse_b,massi_b,mom_b,energy_b = check_properties_main(data_unnorm[:,:,:,:-1],\
+                                                               targets_nof[:,:,:,:-1],temp,vol,cons) 
+        masse_a,massi_a,mom_a,energy_a = check_properties_main(data_unnorm[:,:,:,:-1],\
+                                                              outputs_nof[:,:,:,:-1],temp,vol,cons)
+        
+#         print('targets',masse_b.max().item(),massi_b.max().item(),mom_b.max().item(),energy_b.max().item())
+#         print('outputs',masse_a.max().item(),massi_a.max().item(),mom_a.max().item(),energy_a.max().item())
+        
+        props_before.append([(torch.sum(massi_b+masse_b)/nbatch).item(),\
                              (torch.sum(mom_b)/nbatch).item(),\
                              (torch.sum(energy_b)/nbatch).item()])
-        props_after.append([torch.sum((mass_a)/nbatch).item(),\
+        props_after.append([torch.sum((massi_a+massi_b)/nbatch).item(),\
                              torch.sum((mom_a)/nbatch).item(),\
                              torch.sum((energy_a)/nbatch).item()])
                 
-        mass_loss = torch.sum(torch.abs(mass_a - mass_b)).float()/nbatch
+        masse_loss = torch.sum(torch.abs(masse_a - masse_b)).float()/nbatch
+        massi_loss = torch.sum(torch.abs(massi_a - massi_b)).float()/nbatch
+        mass_loss = massi_loss + masse_loss
         mom_loss = torch.sum(torch.abs(mom_a - mom_b)).float()/nbatch
         energy_loss = torch.sum(torch.abs(energy_a - energy_b)).float()/nbatch        
         
-        l2_loss = criterion(outputs,targets)  
+        l2_loss = criterion(outputs[:,0],targets[:,1])  
                   
         #loss = l2_loss  
         loss = l2_loss*loss_weights[0] \
@@ -1239,7 +1257,7 @@ def train(trainloader,valloader,sp_flag,epoch,end,zvars,cons):
             #plot_df(targets_unnorm[0,0,:,:-1],outputs_unnorm[0,0,:,:-1],epoch)
         
         if i % val_rate == val_rate-1:         
-          val_loss = validate(valloader,props,cons,zvars)
+          val_loss = validate(valloader,cons,zvars)
           val_loss_vector.append(val_loss)
         
           is_best = False
@@ -1276,25 +1294,32 @@ def validate(valloader,cons,zvars):
       
       outputs = net(data)
       outputs = outputs.to(device)
-      
-      nbatch = len(data)
+            
+      nbatch = len(data)     
+
       data_unnorm = data*zvars.std_f[:nbatch] + zvars.mean_f[:nbatch]
-      targets_unnorm = targets*zvars.std_df[:nbatch,0] + zvars.mean_df[:nbatch,0]
-      outputs_unnorm = outputs*zvars.std_df[:nbatch,0] + zvars.mean_df[:nbatch,0]
-        
-      targets_nof = targets_unnorm - data_unnorm[:,0,:,:]
-      outputs_nof = outputs_unnorm - data_unnorm[:,0,:,:]
-          
-      mass_b,mom_b,energy_b = check_properties_main(data_unnorm[:,:,:,:-1],\
+      targets_unnorm = targets*zvars.std_df[:nbatch] + zvars.mean_df[:nbatch]
+      outputs_unnorm = outputs[:nbatch,0]*zvars.std_df[:nbatch,1] + zvars.mean_df[:nbatch,1]
+
+      targets_nof = targets_unnorm - data_unnorm
+      outputs_nof = outputs_unnorm[:nbatch] - data_unnorm[:nbatch,1]
+
+      # concatenate with actual dfe
+      outputs_nof = torch.cat((targets_nof[:nbatch,0].unsqueeze(1),outputs_nof[:nbatch].unsqueeze(1)),1)
+
+      
+      masse_b,massi_b,mom_b,energy_b = check_properties_main(data_unnorm[:,:,:,:-1],\
                                                  targets_nof[:,:,:,:-1],temp,vol,cons) 
-      mass_a,mom_a,energy_a = check_properties_main(data_unnorm[:,:,:,:-1],\
+      masse_a,massi_a,mom_a,energy_a = check_properties_main(data_unnorm[:,:,:,:-1],\
                                                  outputs_nof[:,:,:,:-1],temp,vol,cons)  
       
-      mass_loss = torch.sum(torch.abs(mass_a - mass_b)).float()/nbatch
+      masse_loss = torch.sum(torch.abs(masse_a - masse_b)).float()/nbatch
+      massi_loss = torch.sum(torch.abs(massi_a - massi_b)).float()/nbatch
+      mass_loss = massi_loss + masse_loss
       mom_loss = torch.sum(torch.abs(mom_a - mom_b)).float()/nbatch
       energy_loss = torch.sum(torch.abs(energy_a - energy_b)).float()/nbatch   
      
-      l2_loss = criterion(outputs, targets)
+      l2_loss = criterion(outputs[:,0],targets[:,1])  
       
       loss = l2_loss*loss_weights[0] \
            + mass_loss*loss_weights[1] \
@@ -1337,13 +1362,13 @@ def test(f_test,df_test,temp_test,vol_test):
             if len(data) != batch_size:
               limit = len(data)
               data_unnorm = data*std_f[:limit] + mean_f[:limit]
-              targets_unnorm = targets*std_df[:limit,0] + mean_df[:limit,0]
-              outputs_unnorm = outputs*std_df[:limit,0] + mean_df[:limit,0]
+              targets_unnorm = targets*std_df[:limit] + mean_df[:limit]
+              outputs_unnorm = outputs*std_df[:limit] + mean_df[:limit]
 
             else:
               data_unnorm = data*std_f + mean_f
-              targets_unnorm = targets*std_df[:,0] + mean_df[:,0]
-              outputs_unnorm = outputs*std_df[:,0] + mean_df[:,0]
+              targets_unnorm = targets*std_df + mean_df
+              outputs_unnorm = outputs*std_df + mean_df
                        
             props_before.append([torch.sum(each_prop).item()\
                                  for each_prop in check_properties_main(data_unnorm[:,:,:,:-1],\
@@ -1364,9 +1389,9 @@ def test(f_test,df_test,temp_test,vol_test):
     num_error = len(cons_array)
     cons_error = np.zeros([3,num_error])
     
-    cons_error[0] = np.abs((cons_array[:,3]-cons_array[:,0])/cons_array[:,0])
-    cons_error[1] = np.abs((cons_array[:,4]-cons_array[:,1])/cons_array[:,1])
-    cons_error[2] = np.abs((cons_array[:,5]-cons_array[:,2])/cons_array[:,2])
+    cons_error[0] = np.abs(((cons_array[:,4]+cons_array[:,5])-(cons_array[:,0]+cons_array[:,1]))/(cons_array[:,0]+cons_array[:,1]))
+    cons_error[1] = np.abs((cons_array[:,6]-cons_array[:,2])/cons_array[:,2])
+    cons_error[2] = np.abs((cons_array[:,7]-cons_array[:,3])/cons_array[:,3])
     
     print('Finished testing')
     print('Percentage with MSE<1: %d %%' % (
