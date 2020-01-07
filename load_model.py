@@ -16,29 +16,33 @@ import torch.nn as nn
 import torch.optim as optim
 import timeit
 import h5py
+import sys
 from torch.utils.data import Dataset, DataLoader
 from scipy import stats
 from torch.nn import functional as F
 from torch.autograd import Variable
-from radam import RAdam, PlainRAdam, AdamW
+from matplotlib.tri import Triangulation
+
+dir = sys.argv[1]
 
 batch_size = 64
-lr = 1e-4
+lr = 1e-5
 momentum = 0.99
-num_epochs = 200
-percentage_train = 0.8
-percentage_val = 0.1
-lr_decay = 0.25
-step_size = 20
+num_epochs = 100
+percentage_train = 1
+percentage_val = 0
+lr_decay = 0.5
+step_size = 5
 # loss_weights = [1,1e0,1e21,1e15]
-loss_weights = [1,0.05,0.05,0.05,0.05]
-nphi = 4
+loss_weights = [0,0.1,0.1,0.1,0.1]
+nphi = 1
 plot_rate = 250
-output_rate = 250
-val_rate = 1000
+output_rate = 500
+val_rate = 2000
 datapath = '/scratch/gpfs/marcoam/ml_collisions/data/xgc1/ti272_JET_heat_load/'
 run_num = '00094/'
 lim = 80000
+modelpath = '/home/marcoam/runs/'+str(dir)+'/checkpoint.pth.tar'
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -917,9 +921,9 @@ def load_data_hdf(iphi):
   i_f = hf_f['i_f'][iphi]
   e_df = hf_df['e_df'][iphi] 
   i_df = hf_df['i_df'][iphi]
-  
+ 
   ind1,ind2,ind3 = i_f.shape
- #change lim back to ind2 if want full set 
+  
   f = np.zeros([lim,2,ind1,ind1])
   df = np.zeros([lim,2,ind1,ind1])
 
@@ -1025,7 +1029,7 @@ def split_data(f,df,cons,num_nodes):
     
     inds = np.arange(num_nodes)
     #np.random.seed(0)
-    np.random.shuffle(inds) 
+    #np.random.shuffle(inds) 
     
     num_train = int(np.floor(percentage_train*num_nodes))
     num_val = int(np.floor(percentage_val*num_nodes))
@@ -1063,16 +1067,11 @@ def split_data(f,df,cons,num_nodes):
     trainset = DistFuncDataset(f_train, df_train, temp_train, vol_train)
     
     trainloader = DataLoader(trainset, batch_size=batch_size, 
-                             shuffle=True, pin_memory=True, num_workers=4)
+                             shuffle=False, pin_memory=True, num_workers=4)
     
     del f_train, df_train, temp_train, vol_train
     
-    valset = DistFuncDataset(f_val, df_val, temp_val, vol_val)
-    
-    valloader = DataLoader(valset, batch_size=batch_size, 
-                           shuffle=True, pin_memory=True, num_workers=4)
-        
-    return trainloader, valloader, f_test, df_test, temp_test, vol_test
+    return trainloader, f_test, df_test, temp_test, vol_test
 
 """# check props"""
 
@@ -1206,8 +1205,7 @@ def train(trainloader,valloader,sp_flag,epoch,end,zvars,cons):
         data_unnorm = data*zvars.std_f[:nbatch] + zvars.mean_f[:nbatch]
         targets_unnorm = targets*zvars.std_fdf[:nbatch] + zvars.mean_fdf[:nbatch]
         outputs_unnorm = outputs[:,0]*zvars.std_fdf[:nbatch,1] + zvars.mean_fdf[:nbatch,1]
-        
-	# don't think I need some of these nbatch but unsure           
+                   
         targets_nof = targets_unnorm - data_unnorm
         outputs_nof = outputs_unnorm[:nbatch] - data_unnorm[:nbatch,1]
         
@@ -1215,7 +1213,7 @@ def train(trainloader,valloader,sp_flag,epoch,end,zvars,cons):
         targets_nof_to_cat = targets_nof[:nbatch,0].unsqueeze(1)        
         
         # concatenate with actual dfe
-        outputs_nof = torch.cat((targets_nof_to_cat,outputs_nof_to_cat),1)
+        outputs_nof = torch.cat((outputs_nof_to_cat,targets_nof_to_cat),1)
                   
         # updated calls to check_properties with correct arguments  
         masse_b,massi_b,mom_b,energy_b = check_properties_main(data_unnorm[:,:,:,:-1],\
@@ -1223,7 +1221,7 @@ def train(trainloader,valloader,sp_flag,epoch,end,zvars,cons):
 
         masse_a,massi_a,mom_a,energy_a = check_properties_main(data_unnorm[:,:,:,:-1],\
                                                                outputs_nof[:,:,:,:-1],temp,vol,cons)
-                       
+
         props_before.append([(torch.sum(massi_b+masse_b)/nbatch).item(),\
                              (torch.sum(mom_b)/nbatch).item(),\
                              (torch.sum(energy_b)/nbatch).item()])
@@ -1236,18 +1234,17 @@ def train(trainloader,valloader,sp_flag,epoch,end,zvars,cons):
         mom_loss = torch.sum(mom_a)/nbatch
         energy_loss = torch.sum(energy_a)/nbatch
 
+        if i % 200 == 199:
+            print('outputs',masse_loss.item(),massi_loss.item(),mom_loss.item(),energy_loss.item())
+                
         #masse_loss = torch.sum(torch.abs(masse_a - masse_b)).float()/nbatch
         #massi_loss = torch.sum(torch.abs(massi_a - massi_b)).float()/nbatch
         #mass_loss = massi_loss + masse_loss
         #mom_loss = torch.sum(torch.abs(mom_a - mom_b)).float()/nbatch
         #energy_loss = torch.sum(torch.abs(energy_a - energy_b)).float()/nbatch    
                 
-        l2_loss = criterion(outputs[:,0],targets[:,1])      
-        
-        if i % 100 == 99:
-            print('masse',masse_loss.item(),'massi',massi_loss.item(),'mom',mom_loss.item(),'en',energy_loss.item(),'l2',l2_loss.item())
-                
-              
+        l2_loss = criterion(outputs[:,0],targets[:,1])  
+                  
 #        loss = l2_loss*loss_weights[0] \
 #             + mass_loss*loss_weights[1] \
 #             + mom_loss*loss_weights[2] \
@@ -1277,7 +1274,7 @@ def train(trainloader,valloader,sp_flag,epoch,end,zvars,cons):
         running_loss += loss.item()
         running_l2_loss += l2_loss.item()
         running_cons_loss += cons_loss.item()
-       
+        
         if i % output_rate == output_rate-1:
             print('   [%d, %5d] loss: %.6f' %
                   (epoch + 1, end + i + 1, running_loss / output_rate))
@@ -1304,7 +1301,7 @@ def train(trainloader,valloader,sp_flag,epoch,end,zvars,cons):
           if val_loss < np.min(val_loss_vector): ## check this
             is_best = True 
 
-          if i % val_rate == val_rate-1:
+          if i % (2*val_rate) == (2*val_rate-1):
             save_checkpoint({
                              'epoch': epoch+1,
                              'state_dict': net.state_dict(),
@@ -1348,7 +1345,7 @@ def validate(valloader,cons,zvars):
       targets_nof_to_cat = targets_nof[:nbatch,0].unsqueeze(1)        
         
       # concatenate with actual dfe
-      outputs_nof = torch.cat((targets_nof_to_cat,outputs_nof_to_cat),1)
+      outputs_nof = torch.cat((outputs_nof_to_cat,targets_nof_to_cat),1)
 
       masse_b,massi_b,mom_b,energy_b = check_properties_main(data_unnorm[:,:,:,:-1],\
                                                  targets_nof[:,:,:,:-1],temp,vol,cons) 
@@ -1468,6 +1465,170 @@ def save_checkpoint(state, is_best, lr, filename='checkpoint.pth.tar'):
   if is_best:
     shutil.copy(filename, 'model_best.pth.tar')
 
+def test_load(trainloader,zvars,cons):
+ 
+  fid1 = open('/home/marcoam/runs/'+str(dir)+'/masse.txt','a')
+  fid2 = open('/home/marcoam/runs/'+str(dir)+'/massi.txt','a')
+  fid3 = open('/home/marcoam/runs/'+str(dir)+'/mom.txt','a')
+  fid4 = open('/home/marcoam/runs/'+str(dir)+'/en.txt','a')
+  fid5 = open('/home/marcoam/runs/'+str(dir)+'/contour.txt','a')
+  
+  f_worst = {}
+  s_worst = {}
+  
+  f_worst['error'] = 0
+  s_worst['error'] = 0
+ 
+  f_worst['ind'] = 0
+  f_worst['fe'] = 0
+  f_worst['fi'] = 0
+  f_worst['dfxgc'] = 0
+  f_worst['dfml'] = 0
+
+#  for i in range(0):
+  for i, (data, targets, temp, vol) in enumerate(trainloader):	
+#    print(i)    
+    time1test = timeit.default_timer()
+
+    data, targets, temp, vol = data.to(device), targets.to(device), temp.to(device), vol.to(device)
+    
+    checkpoint = torch.load(modelpath)
+    net.load_state_dict(checkpoint['state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer'])
+    epoch = checkpoint['epoch']
+    net.eval()
+   
+    outputs = net(data)
+    outputs = outputs.to(device)
+
+    nbatch = len(data) 
+        
+    data_unnorm = data*zvars.std_f[:nbatch] + zvars.mean_f[:nbatch]
+    targets_unnorm = targets*zvars.std_fdf[:nbatch] + zvars.mean_fdf[:nbatch]
+    outputs_unnorm = outputs[:,0]*zvars.std_fdf[:nbatch,1] + zvars.mean_fdf[:nbatch,1]
+                    
+    targets_nof = targets_unnorm - data_unnorm
+    outputs_nof = outputs_unnorm[:nbatch] - data_unnorm[:nbatch,1]
+        
+    outputs_nof_to_cat = outputs_nof[:nbatch].unsqueeze(1)
+    targets_nof_to_cat = targets_nof[:nbatch,0].unsqueeze(1)        
+        
+    # concatenate with actual dfe
+    outputs_nof = torch.cat((targets_nof_to_cat,outputs_nof_to_cat),1)
+                  
+    # updated calls to check_properties with correct arguments  
+    masse_b,massi_b,mom_b,energy_b = check_properties_main(data_unnorm[:,:,:,:-1],\
+                                                               targets_nof[:,:,:,:-1],temp,vol,cons)
+
+    masse_a,massi_a,mom_a,energy_a = check_properties_main(data_unnorm[:,:,:,:-1],\
+                                                               outputs_nof[:,:,:,:-1],temp,vol,cons)
+
+#    l2_loss = criterion(outputs[:0],targets[:,1])
+    masse_a,massi_a,mom_a,energy_a = masse_a.cpu(),massi_a.cpu(),mom_a.cpu(),energy_a.cpu()
+    masse_b,massi_b,mom_b,energy_b = masse_b.cpu(),massi_b.cpu(),mom_b.cpu(),energy_b.cpu()
+
+    # find worst and 2nd worst and write f and df
+    for j in range(nbatch):
+      if mom_a[j] > s_worst['error']:
+        s_worst['error'] = mom_a[j]
+        s_worst['ind'] = nbatch*i+j
+        s_worst['fe'] = data_unnorm[j,0,:,:-1].cpu().detach().numpy()
+        s_worst['fi'] = data_unnorm[j,1,:,:-1].cpu().detach().numpy()
+        s_worst['dfxgc'] = targets_nof[j,1,:,:-1].cpu().detach().numpy()
+        s_worst['dfml'] = outputs_nof[j,1,:,:-1].cpu().detach().numpy()
+
+        if mom_a[j] > f_worst['error']:
+          s_worst['error'] = f_worst['error']
+          s_worst['ind'] = f_worst['ind']
+          s_worst['fe'] = f_worst['fe']
+          s_worst['fi'] = f_worst['fi']
+          s_worst['dfxgc'] = f_worst['dfxgc']
+          s_worst['dfml'] = f_worst['dfml']
+
+          f_worst['error'] = mom_a[j]
+          f_worst['ind'] = nbatch*i+j
+          f_worst['fe'] = data_unnorm[j,0,:,:-1].cpu().detach().numpy()
+          f_worst['fi'] = data_unnorm[j,1,:,:-1].cpu().detach().numpy()
+          f_worst['dfxgc'] = targets_nof[j,1,:,:-1].cpu().detach().numpy()
+          f_worst['dfml'] = outputs_nof[j,1,:,:-1].cpu().detach().numpy()
+
+ 
+      fid1.write(str(masse_a[j].item())+' '+str(masse_b[j].item())+'\n')	
+      fid2.write(str(massi_a[j].item())+' '+str(massi_b[j].item())+'\n')	
+      fid3.write(str(mom_a[j].item())+' '+str(mom_b[j].item())+'\n')	
+      fid4.write(str(energy_a[j].item())+' '+str(energy_b[j].item())+'\n')	
+  fid1.close()
+  fid2.close()
+  fid3.close()
+  fid4.close()
+
+# write 1st worst and 2nd worst
+  fid_f1 = open('/home/marcoam/runs/'+str(dir)+'/first_worst_fe.txt','w')
+  fid_f2 = open('/home/marcoam/runs/'+str(dir)+'/first_worst_fi.txt','w')
+  fid_f3 = open('/home/marcoam/runs/'+str(dir)+'/first_worst_dfxgc.txt','w')
+  fid_f4 = open('/home/marcoam/runs/'+str(dir)+'/first_worst_dfml.txt','w')
+  fid_f5 = open('/home/marcoam/runs/'+str(dir)+'/first_worst_info.txt','w')
+ 
+  for line in f_worst['fe']: #fe
+    for entry in line:
+      fid_f1.write(str(entry)+' ')
+    fid_f1.write('\n')
+  for line in f_worst['fi']: #fi
+    for entry in line:
+      fid_f2.write(str(entry)+' ')
+    fid_f2.write('\n')
+  for line in f_worst['dfxgc']: #dfxgc
+    for entry in line:
+      fid_f3.write(str(entry)+' ')
+    fid_f3.write('\n')
+  for line in f_worst['dfml']: #dfml
+    for entry in line:
+      fid_f4.write(str(entry)+' ')
+    fid_f4.write('\n')
+  fid_f5.write(str(f_worst['ind'])+'\n')
+  fid_f5.write(str(f_worst['error'].item()))
+  
+  fid_s1 = open('/home/marcoam/runs/'+str(dir)+'/second_worst_fe.txt','w')
+  fid_s2 = open('/home/marcoam/runs/'+str(dir)+'/second_worst_fi.txt','w')
+  fid_s3 = open('/home/marcoam/runs/'+str(dir)+'/second_worst_dfxgc.txt','w')
+  fid_s4 = open('/home/marcoam/runs/'+str(dir)+'/second_worst_dfml.txt','w')
+  fid_s5 = open('/home/marcoam/runs/'+str(dir)+'/second_worst_info.txt','w')
+ 
+  for line in s_worst['fe']: #fe
+    for entry in line:
+      fid_s1.write(str(entry)+' ')
+    fid_s1.write('\n')
+  for line in s_worst['fi']: #fi
+    for entry in line:
+      fid_s2.write(str(entry)+' ')
+    fid_s2.write('\n')
+  for line in s_worst['dfxgc']: #dfxgc
+    for entry in line:
+      fid_s3.write(str(entry)+' ')
+    fid_s3.write('\n')
+  for line in s_worst['dfml']: #dfml
+    for entry in line:
+      fid_s4.write(str(entry)+' ')
+    fid_s4.write('\n')
+  fid_s5.write(str(s_worst['ind'])+'\n')
+  fid_s5.write(str(s_worst['error'].item()))
+
+  fm = h5py.File('/scratch/gpfs/marcoam/ml_collisions/data/xgc1/ti272_JET_heat_load/00094/xgc.mesh.h5','r')
+  RZ = fm['RZ'][...]
+  tri = fm['tri'][...]
+  fid5.write('rz\n')
+  for r in RZ:
+    fid5.write(str(r[0])+'\n')
+    fid5.write(str(r[1])+'\n')
+  fid5.write('tri\n')
+  for t in tri:
+    fid5.write(str(t[0])+'\n')
+    fid5.write(str(t[1])+'\n')
+    fid5.write(str(t[2])+'\n')
+  fid5.close()
+
+  return None
+
 """# plot"""
 
 def plot_df(df_xgc,df_ml,epoch):
@@ -1507,137 +1668,34 @@ start = timeit.default_timer()
 criterion = nn.MSELoss()
 
 optimizer = optim.SGD(net.parameters(), lr=lr, momentum=momentum)
-#optimizer = RAdam(net.parameters())
+#optimizer = optim.Adam(net.parameters(), lr=lr)
 scheduler = optim.lr_scheduler.StepLR(optimizer,step_size=step_size,gamma=lr_decay)
-#scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer)
 
-for epoch in range(num_epochs):
+train_loss = []
+val_loss = []
 
-  lr_epoch = [group['lr'] for group in optimizer.param_groups][0]
-
-  print('Epoch: {} (lr = {})'.format(epoch+1,lr_epoch)) 
-  
-  epoch1 = timeit.default_timer() 
-  end = 0
-  for iphi in range(nphi):
-
-    print('Beginning training iphi = {}'.format(iphi))
-    print('   Loading data')
-    load1 = timeit.default_timer()
-    f,df,num_nodes,zvars,cons = load_data_hdf(iphi)
-    load2 = timeit.default_timer()
-    print('      Loading time: %.3fs' % (load2-load1))
-
-    print('   Creating training set')
-    trainloader,valloader,f_test,df_test,temp_test,vol_test = split_data(f,df,cons,num_nodes)
-    del f,df
-    
-    train1 = timeit.default_timer()
-    ### gather testing data
-    if epoch == 0:
-      if iphi == 0:
-        f_all_test,df_all_test,temp_all_test,vol_all_test = f_test,df_test,temp_test,vol_test
-        del f_test,df_test,temp_test,vol_test
-
-        print('   Starting training')
-        train_loss, l2_loss, cons_loss, val_loss, cons_array, end = \
-                                   train(trainloader,valloader,0,epoch,end,zvars,cons)
-
-      else:
-        f_all_test = np.vstack((f_all_test,f_test))
-        df_all_test = np.vstack((df_all_test,df_test))
-        temp_all_test = np.vstack((temp_all_test,temp_test))
-        vol_all_test = np.vstack((vol_all_test,vol_test))
-        del f_test,df_test,temp_test,vol_test
-
-        print('   Starting training')
-        train_loss_to_app, l2_loss_to_app, cons_loss_to_app, val_loss_to_app, cons_to_cat, end = \
-                                   train(trainloader,valloader,0,epoch,end,zvars,cons)
-
-        for loss1 in train_loss_to_app:
-          train_loss.append(loss1)
-        for loss2 in l2_loss_to_app:
-          l2_loss.append(loss2)
-        for loss3 in cons_loss_to_app:
-          cons_loss.append(loss3)          
-        for loss4 in val_loss_to_app:
-          val_loss.append(loss4)      
-       # cons_array = np.concatenate((cons_array, cons_to_cat), axis=1)
-    
-    else:
-      del f_test,df_test,temp_test,vol_test
-      print('   Starting training')
-      train_loss_to_app, l2_loss_to_app, cons_loss_to_app, val_loss_to_app, cons_to_cat, end = \
-                                 train(trainloader,valloader,0,epoch,end,zvars,cons)
-
-      for loss1 in train_loss_to_app:
-          train_loss.append(loss1)
-      for loss2 in l2_loss_to_app:
-          l2_loss.append(loss2)         
-      for loss3 in cons_loss_to_app:
-          cons_loss.append(loss3)          
-      for loss4 in val_loss_to_app:
-          val_loss.append(loss4)      
-      #cons_array = np.concatenate((cons_array, cons_to_cat), axis=0)
-         
-    train2 = timeit.default_timer()
-    print('Finished tranining iphi = {}'.format(iphi))
-    print('   Training time for iphi = %d: %.3fs' % (iphi,train2-train1))
-  
-  #train_iterations = np.linspace(1,len(train_loss),len(train_loss))
-  #val_iterations = np.linspace(2,len(train_loss),len(val_loss))
-
-  fid_loss1 = open('train_tmp.txt','w')
-  fid_loss2 = open('val_tmp.txt','w')
-  fid_loss3 = open('l2_tmp.txt','w')
-  fid_loss4 = open('cons_tmp.txt','w')
-  lr_command = 'w' if epoch == 0 else 'a'
-  fid_lr = open('lr.txt',lr_command) 
-
-  for loss in train_loss:
-    fid_loss1.write(str(loss)+'\n')
-  for loss in val_loss:
-    fid_loss2.write(str(loss)+'\n')
-  for loss in l2_loss:
-    fid_loss3.write(str(loss)+'\n')
-  for loss in cons_loss:
-    fid_loss4.write(str(loss)+'\n')
-  fid_lr.write(str(lr_epoch)+'\n')
-  
-  fid_loss1.close()
-  fid_loss2.close()
-  fid_loss3.close()
-  fid_loss4.close()
-  fid_lr.close()
+lr_epoch = [group['lr'] for group in optimizer.param_groups][0]
  
-  #plt.plot(train_iterations,train_loss,'-o',color='blue')
-  #plt.plot(val_iterations,val_loss,'-o',color='orange')
-  #plt.plot(train_iterations,l2_loss,'-o',color='red')
-  #plt.plot(train_iterations,cons_loss,'-o',color='green')
-  #plt.legend(['total','validation','l2','cons'])
-  #plt.yscale('log')
-  #plt.show()
-  
-  epoch2 = timeit.default_timer()
-  scheduler.step()
-  #scheduler.step(val_loss[-1])
-  print('Epoch time: {}s\n'.format(epoch2-epoch1))
+for iphi in range(nphi):
 
-print('Starting testing')
-l2_error_i, cons_error_i = test(f_all_test,df_all_test,temp_all_test,vol_all_test)
-print('Finished testing')
+  print('Beginning training iphi = {}'.format(iphi))
+  print('   Loading data')
+  load1 = timeit.default_timer()
+  f,df,num_nodes,zvars,cons = load_data_hdf(iphi)
+  load2 = timeit.default_timer()
+  print('      Loading time: %.3fs' % (load2-load1))
 
-stop = timeit.default_timer()
-print('Runtime: %.3fmins' % ((stop-start)/60))
+  print('   Creating training set')
+  trainloader,f_test,df_test,temp_test,vol_test = split_data(f,df,cons,num_nodes)
+  del f,df
 
-## used to see differences between voli/e and f0_grid_vol 
+  print('   Running previously loaded model') 
+  fid1 = open('/home/marcoam/runs/'+str(dir)+'/masse.txt','w')
+  fid2 = open('/home/marcoam/runs/'+str(dir)+'/massi.txt','w')
+  fid3 = open('/home/marcoam/runs/'+str(dir)+'/mom.txt','w')
+  fid4 = open('/home/marcoam/runs/'+str(dir)+'/en.txt','w')
+  fid5 = open('/home/marcoam/runs/'+str(dir)+'/contour.txt','w')
+  test_load(trainloader,zvars,cons) 
+ 
+   
 
-# fid1 = h5py.File('/content/hdf5_data/hdf_vol.h5','r')
-# fid2 = h5py.File('/content/hdf5_data/hdf_cons_fullvol.h5','r')
-
-# vole1 = fid1['vole'][0]
-# voli1 = fid1['vole'][0]
-
-# f0_grid_vol = fid2['f0_grid_vol'][...]
-# vole2 = f0_grid_vol[0]
-# voli2 = f0_grid_vol[1]
