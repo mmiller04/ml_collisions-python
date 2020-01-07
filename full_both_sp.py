@@ -20,23 +20,25 @@ from torch.utils.data import Dataset, DataLoader
 from scipy import stats
 from torch.nn import functional as F
 from torch.autograd import Variable
+from radam import RAdam, PlainRAdam, AdamW
 
-batch_size = 32
-lr = 1e-5
+batch_size = 64
+lr = 1e-4
 momentum = 0.99
-num_epochs = 100
+num_epochs = 200
 percentage_train = 0.8
 percentage_val = 0.1
-lr_decay = 0.5
-step_size = 5
+lr_decay = 0.25
+step_size = 20
 # loss_weights = [1,1e0,1e21,1e15]
-loss_weights = [1,0.1,0.1,0.1,0.1]
-nphi = 1
+loss_weights = [1,0.05,0.05,0.05,0.05]
+nphi = 4
 plot_rate = 250
-output_rate = 500
-val_rate = 2000
+output_rate = 250
+val_rate = 1000
 datapath = '/scratch/gpfs/marcoam/ml_collisions/data/xgc1/ti272_JET_heat_load/'
 run_num = '00094/'
+lim = 80000
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -917,11 +919,11 @@ def load_data_hdf(iphi):
   i_df = hf_df['i_df'][iphi]
   
   ind1,ind2,ind3 = i_f.shape
-  
-  f = np.zeros([ind2,2,ind1,ind1])
-  df = np.zeros([ind2,2,ind1,ind1])
+ #change lim back to ind2 if want full set 
+  f = np.zeros([lim,2,ind1,ind1])
+  df = np.zeros([lim,2,ind1,ind1])
 
-  for n in range(ind2):
+  for n in range(lim):
     f[n,0,:,:-1] = e_f[:,n,:]
     f[n,1,:,:-1] = i_f[:,n,:]
     df[n,0,:,:-1] = e_df[:,n,:]
@@ -943,7 +945,7 @@ def load_data_hdf(iphi):
   hf_stats = h5py.File(datapath+run_num+'hdf_stats.h5','r')
   zvars = stats_variables(hf_stats)
   
-  for n in range(ind2):
+  for n in range(lim):
     f[n] = (f[n]-zvars.mean_f)/zvars.std_f
 #     df[n] = (df[n]-zvars.mean_df)/zvars.std_df
     df[n] = (df[n]-zvars.mean_fdf)/zvars.std_fdf
@@ -970,7 +972,7 @@ def load_data_hdf(iphi):
   zvars.std_df = torch.from_numpy(zvars.std_df).to(device).float()
   zvars.std_fdf = torch.from_numpy(zvars.std_fdf).to(device).float()
        
-  return f,df,ind2,zvars,cons
+  return f,df,lim,zvars,cons
 
 class stats_variables():
   
@@ -1204,7 +1206,8 @@ def train(trainloader,valloader,sp_flag,epoch,end,zvars,cons):
         data_unnorm = data*zvars.std_f[:nbatch] + zvars.mean_f[:nbatch]
         targets_unnorm = targets*zvars.std_fdf[:nbatch] + zvars.mean_fdf[:nbatch]
         outputs_unnorm = outputs[:,0]*zvars.std_fdf[:nbatch,1] + zvars.mean_fdf[:nbatch,1]
-                   
+        
+	# don't think I need some of these nbatch but unsure           
         targets_nof = targets_unnorm - data_unnorm
         outputs_nof = outputs_unnorm[:nbatch] - data_unnorm[:nbatch,1]
         
@@ -1212,7 +1215,7 @@ def train(trainloader,valloader,sp_flag,epoch,end,zvars,cons):
         targets_nof_to_cat = targets_nof[:nbatch,0].unsqueeze(1)        
         
         # concatenate with actual dfe
-        outputs_nof = torch.cat((outputs_nof_to_cat,targets_nof_to_cat),1)
+        outputs_nof = torch.cat((targets_nof_to_cat,outputs_nof_to_cat),1)
                   
         # updated calls to check_properties with correct arguments  
         masse_b,massi_b,mom_b,energy_b = check_properties_main(data_unnorm[:,:,:,:-1],\
@@ -1233,17 +1236,18 @@ def train(trainloader,valloader,sp_flag,epoch,end,zvars,cons):
         mom_loss = torch.sum(mom_a)/nbatch
         energy_loss = torch.sum(energy_a)/nbatch
 
-        if i % 200 == 199:
-            print('outputs',masse_loss.item(),massi_loss.item(),mom_loss.item(),energy_loss.item())
-                
         #masse_loss = torch.sum(torch.abs(masse_a - masse_b)).float()/nbatch
         #massi_loss = torch.sum(torch.abs(massi_a - massi_b)).float()/nbatch
         #mass_loss = massi_loss + masse_loss
         #mom_loss = torch.sum(torch.abs(mom_a - mom_b)).float()/nbatch
         #energy_loss = torch.sum(torch.abs(energy_a - energy_b)).float()/nbatch    
                 
-        l2_loss = criterion(outputs[:,0],targets[:,1])  
-                  
+        l2_loss = criterion(outputs[:,0],targets[:,1])      
+        
+        if i % 100 == 99:
+            print('masse',masse_loss.item(),'massi',massi_loss.item(),'mom',mom_loss.item(),'en',energy_loss.item(),'l2',l2_loss.item())
+                
+              
 #        loss = l2_loss*loss_weights[0] \
 #             + mass_loss*loss_weights[1] \
 #             + mom_loss*loss_weights[2] \
@@ -1273,7 +1277,7 @@ def train(trainloader,valloader,sp_flag,epoch,end,zvars,cons):
         running_loss += loss.item()
         running_l2_loss += l2_loss.item()
         running_cons_loss += cons_loss.item()
-        
+       
         if i % output_rate == output_rate-1:
             print('   [%d, %5d] loss: %.6f' %
                   (epoch + 1, end + i + 1, running_loss / output_rate))
@@ -1300,7 +1304,7 @@ def train(trainloader,valloader,sp_flag,epoch,end,zvars,cons):
           if val_loss < np.min(val_loss_vector): ## check this
             is_best = True 
 
-          if i % (2*val_rate) == (2*val_rate-1):
+          if i % val_rate == val_rate-1:
             save_checkpoint({
                              'epoch': epoch+1,
                              'state_dict': net.state_dict(),
@@ -1344,7 +1348,7 @@ def validate(valloader,cons,zvars):
       targets_nof_to_cat = targets_nof[:nbatch,0].unsqueeze(1)        
         
       # concatenate with actual dfe
-      outputs_nof = torch.cat((outputs_nof_to_cat,targets_nof_to_cat),1)
+      outputs_nof = torch.cat((targets_nof_to_cat,outputs_nof_to_cat),1)
 
       masse_b,massi_b,mom_b,energy_b = check_properties_main(data_unnorm[:,:,:,:-1],\
                                                  targets_nof[:,:,:,:-1],temp,vol,cons) 
@@ -1503,11 +1507,9 @@ start = timeit.default_timer()
 criterion = nn.MSELoss()
 
 optimizer = optim.SGD(net.parameters(), lr=lr, momentum=momentum)
-#optimizer = optim.Adam(net.parameters(), lr=lr)
+#optimizer = RAdam(net.parameters())
 scheduler = optim.lr_scheduler.StepLR(optimizer,step_size=step_size,gamma=lr_decay)
-
-train_loss = []
-val_loss = []
+#scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer)
 
 for epoch in range(num_epochs):
 
@@ -1554,9 +1556,13 @@ for epoch in range(num_epochs):
 
         for loss1 in train_loss_to_app:
           train_loss.append(loss1)
-        for loss2 in val_loss_to_app:
-          val_loss.append(loss2)
-        cons_array = np.concatenate((cons_array, cons_to_cat), axis=1)
+        for loss2 in l2_loss_to_app:
+          l2_loss.append(loss2)
+        for loss3 in cons_loss_to_app:
+          cons_loss.append(loss3)          
+        for loss4 in val_loss_to_app:
+          val_loss.append(loss4)      
+       # cons_array = np.concatenate((cons_array, cons_to_cat), axis=1)
     
     else:
       del f_test,df_test,temp_test,vol_test
@@ -1572,19 +1578,22 @@ for epoch in range(num_epochs):
           cons_loss.append(loss3)          
       for loss4 in val_loss_to_app:
           val_loss.append(loss4)      
-      cons_array = np.concatenate((cons_array, cons_to_cat), axis=0)
+      #cons_array = np.concatenate((cons_array, cons_to_cat), axis=0)
          
     train2 = timeit.default_timer()
     print('Finished tranining iphi = {}'.format(iphi))
     print('   Training time for iphi = %d: %.3fs' % (iphi,train2-train1))
   
-  train_iterations = np.linspace(1,len(train_loss),len(train_loss))
-  val_iterations = np.linspace(2,len(train_loss),len(val_loss))
- 
+  #train_iterations = np.linspace(1,len(train_loss),len(train_loss))
+  #val_iterations = np.linspace(2,len(train_loss),len(val_loss))
+
   fid_loss1 = open('train_tmp.txt','w')
   fid_loss2 = open('val_tmp.txt','w')
   fid_loss3 = open('l2_tmp.txt','w')
   fid_loss4 = open('cons_tmp.txt','w')
+  lr_command = 'w' if epoch == 0 else 'a'
+  fid_lr = open('lr.txt',lr_command) 
+
   for loss in train_loss:
     fid_loss1.write(str(loss)+'\n')
   for loss in val_loss:
@@ -1593,21 +1602,25 @@ for epoch in range(num_epochs):
     fid_loss3.write(str(loss)+'\n')
   for loss in cons_loss:
     fid_loss4.write(str(loss)+'\n')
+  fid_lr.write(str(lr_epoch)+'\n')
+  
   fid_loss1.close()
   fid_loss2.close()
   fid_loss3.close()
   fid_loss4.close()
+  fid_lr.close()
  
-  plt.plot(train_iterations,train_loss,'-o',color='blue')
-  plt.plot(val_iterations,val_loss,'-o',color='orange')
-  plt.plot(train_iterations,l2_loss,'-o',color='red')
-  plt.plot(train_iterations,cons_loss,'-o',color='green')
-  plt.legend(['total','validation','l2','cons'])
-  plt.yscale('log')
-  plt.show()
+  #plt.plot(train_iterations,train_loss,'-o',color='blue')
+  #plt.plot(val_iterations,val_loss,'-o',color='orange')
+  #plt.plot(train_iterations,l2_loss,'-o',color='red')
+  #plt.plot(train_iterations,cons_loss,'-o',color='green')
+  #plt.legend(['total','validation','l2','cons'])
+  #plt.yscale('log')
+  #plt.show()
   
   epoch2 = timeit.default_timer()
   scheduler.step()
+  #scheduler.step(val_loss[-1])
   print('Epoch time: {}s\n'.format(epoch2-epoch1))
 
 print('Starting testing')
