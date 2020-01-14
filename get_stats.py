@@ -11,8 +11,8 @@ import h5py
 import numpy as np
 nsp = 2
 
-hf_f = h5py.File('/content/hdf5_data/hdf_f.h5','r')
-hf_df = h5py.File('/content/hdf5_data/hdf_df.h5','r')
+hf_f = h5py.File('/scratch/gpfs/marcoam/ml_collisions/data/xgc1/ti272_JET_heat_load/00094/hdf_f.h5','r')
+hf_df = h5py.File('/scratch/gpfs/marcoam/ml_collisions/data/xgc1/ti272_JET_heat_load/00094/hdf_df.h5','r')
 
 nphi,nperp,nnode,npar = hf_f.get('i_f').shape
 
@@ -38,10 +38,37 @@ for iphi in range(nphi):
   
   e_f = hf_f['e_f'][iphi]
   i_f = hf_f['i_f'][iphi]
+
+  # replace negative values w/ 0
+  e_f_neg = np.where(e_f < 0)
+  e_f[e_f_neg] = 0
+  i_f_neg = np.where(i_f < 0)
+  i_f[i_f_neg] = 0
   
   e_df = hf_df['e_df'][iphi]
   i_df = hf_df['i_df'][iphi]
   
+  # get lists where df = 0
+  e_df_zero_inds = np.where(np.einsum('ijk -> j',e_df) == 0)
+  e_df_zero_inds = list(e_df_zero_inds[0])
+  
+  i_df_zero_inds = np.where(np.einsum('ijk -> j',i_df) == 0)
+  i_df_zero_inds = list(i_df_zero_inds[0])
+
+  e_inds = list(np.arange(nnode))
+  for e in e_df_zero_inds:
+    e_inds.remove(e) 
+  
+  i_inds = list(np.arange(nnode))
+  for i in i_df_zero_inds:
+    i_inds.remove(i) 
+ 
+  # remove them
+  i_f = i_f[:,i_inds,:]
+  i_df = i_df[:,i_inds,:]
+  e_f = e_f[:,e_inds,:]
+  e_df = e_df[:,e_inds,:]
+
   e_fdf = e_f+e_df
   i_fdf = i_f+i_df
   
@@ -85,20 +112,11 @@ std_f = np.sqrt(std_f/nphi)
 std_df = np.sqrt(std_df/nphi)
 std_fdf = np.sqrt(std_fdf/nphi)
 
-with h5py.File('/content/hdf5_data/hdf_stats.h5','w') as hf:
+with h5py.File('/scratch/gpfs/marcoam/ml_collisions/data/xgc1/ti272_JET_heat_load/00094/hdf_stats.h5','w') as hf:
   hf.create_dataset('mean_f',data=mean_f)
   hf.create_dataset('mean_df',data=mean_df)
   hf.create_dataset('mean_fdf',data=mean_fdf)
   hf.create_dataset('std_f',data=std_f)
   hf.create_dataset('std_df',data=std_df)
   hf.create_dataset('std_fdf',data=std_fdf)
-
-from google.colab import auth
-auth.authenticate_user()
-
-project_id = 'peaceful-impact-247117'
-bucket_name = 'ml_collisions-data1'
-
-!gcloud config set project {project_id}
-!gsutil cp -r /content/hdf5_data/hdf_stats.h5 gs://ml-collisions-data1/hdf5_data
 
