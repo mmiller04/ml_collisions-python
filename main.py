@@ -21,19 +21,21 @@ from scipy import stats
 from torch.nn import functional as F
 from torch.autograd import Variable
 from radam import RAdam, PlainRAdam, AdamW
+from models import Unet,ReSeg,StackedRecurrentHourglass
 
-batch_size = 64
-lr = 1e-4
+batch_size = 128
+lr = 1e-05
 warmup_period = 10
 momentum = 0.99
 num_epochs = 100
 percentage_train = 0.8
 percentage_val = 0.1
 lr_decay = 0.25
-step_size = 10
+step_size = 15
 # loss_weights = [1,1e0,1e21,1e15]
-loss_weights = [0,0.05,0.05,0.05,0.05]
-nphi = 4
+loss_weights = [1,0.05,0.05,0.05,0.05]
+#loss_weights = [1,0,0,0,0]
+nphi = 8
 plot_rate = 500
 output_rate = 500
 val_rate = 1000
@@ -43,869 +45,13 @@ lim = 150000
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-"""# nets"""
+"""# choose network"""
 
-def conv3x3(in_planes, out_planes):
-    return nn.Conv2d(in_planes, out_planes, kernel_size=3, padding=1, bias=True)
-
-class UnetDownBlock(nn.Module):
-   
-    def __init__(self, inplanes, planes, predownsample_block):
-        
-        super(UnetDownBlock, self).__init__()
-        
-        self.predownsample_block = predownsample_block
-        self.conv1 = conv3x3(inplanes, planes)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = conv3x3(planes, planes)
-        
-    def forward(self, x):
-        
-        x = self.predownsample_block(x)
-        x = self.conv1(x)
-        x = self.relu(x)
-        x = self.conv2(x)
-        
-        return x
-    
-class UnetUpBlock(nn.Module):
-   
-    def __init__(self, inplanes, planes, postupsample_block=None):
-        
-        super(UnetUpBlock, self).__init__()
-        
-        self.conv1 = conv3x3(inplanes, planes)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = conv3x3(planes, planes)
-        
-        if postupsample_block is None: 
-            
-            self.postupsample_block = nn.ConvTranspose2d(in_channels=planes,
-                                                         out_channels=planes//2,
-                                                         kernel_size=2,
-                                                         stride=2)
-            
-        else:
-            
-            self.postupsample_block = postupsample_block
-        
-    def forward(self, x):
-        
-        x = self.conv1(x)
-        x = self.relu(x)
-        x = self.conv2(x)
-        x = self.postupsample_block(x)
-        
-        return x
-    
-    
-class Unet(nn.Module):
-    
-    def __init__(self):
-        
-        super(Unet, self).__init__()
-        
-        self.predownsample_block = nn.MaxPool2d(kernel_size=2, stride=2)
-        
-        self.identity_block = nn.Sequential()
-        
-        self.block1 = UnetDownBlock(
-                                    predownsample_block=self.identity_block,
-                                    inplanes=2, planes=64
-                                    )
-        
-        self.block2_down = UnetDownBlock(
-                                         predownsample_block=self.predownsample_block,
-                                         inplanes=64, planes=128
-                                         )
-        
-        self.block3_down = UnetDownBlock(
-                                         predownsample_block=self.predownsample_block,
-                                         inplanes=128, planes=256
-                                         )
-
-        self.block4_down = UnetDownBlock(
-                                         predownsample_block=self.predownsample_block,
-                                         inplanes=256, planes=512
-                                         )
-        
-        self.block5_down = UnetDownBlock(
-                                         predownsample_block=self.predownsample_block,
-                                         inplanes=512, planes=1024
-                                         )
-        
-        self.block1_up = nn.ConvTranspose2d(in_channels=1024, out_channels=512,
-                                                  kernel_size=2, stride=2)
-        
-        self.block2_up = UnetUpBlock(
-                                     inplanes=1024, planes=512
-                                     )
-        
-        self.block3_up = UnetUpBlock(
-                                     inplanes=512, planes=256
-                                     )
-        
-        self.block4_up = UnetUpBlock(
-                                     inplanes=256, planes=128
-                                     )
-        
-        self.block5 = UnetUpBlock(
-                                  inplanes=128, planes=64,
-                                  postupsample_block=self.identity_block
-                                  )
-        
-        self.logit_conv = nn.Conv2d(
-                                    in_channels=64, out_channels=1, kernel_size=1,
-                                    )
-        
-        
-    def forward(self, x):
-        
-        features_1s_down = self.block1(x)
-        features_2s_down = self.block2_down(features_1s_down)
-        features_4s_down = self.block3_down(features_2s_down)
-        features_8s_down = self.block4_down(features_4s_down)
-        
-        features_16s = self.block5_down(features_8s_down)
-        
-        features_8s_up = self.block1_up(features_16s)
-        features_8s_up = torch.cat([features_8s_down, features_8s_up],dim=1)
-        
-        features_4s_up = self.block2_up(features_8s_up)
-        features_4s_up = torch.cat([features_4s_down, features_4s_up],dim=1)
-        
-        features_2s_up = self.block3_up(features_4s_up)
-        features_2s_up = torch.cat([features_2s_down, features_2s_up],dim=1)
-        
-        features_1s_up = self.block4_up(features_2s_up)
-        features_1s_up = torch.cat([features_1s_down, features_1s_up],dim=1)
-        
-        features_final = self.block5(features_1s_up)
-        
-        logits = self.logit_conv(features_final)
-       
-        return logits
-
-class VGG(nn.Module):
-    
-    def __init__(self, features, num_classes=1000, init_weights=True):
-        super(VGG, self).__init__()
-        self.features = features
-        self.avgpool = nn.AdaptiveAvgPool2d((7, 7))
-        self.classifier = nn.Sequential(
-            nn.Linear(512 * 7 * 7, 4096),
-            nn.ReLU(True),
-            nn.Dropout(),
-            nn.Linear(4096, 4096),
-            nn.ReLU(True),
-            nn.Dropout(),
-            nn.Linear(4096, num_classes),
-        )
-        if init_weights:
-            self._initialize_weights()
-
-    def forward(self, x):
-        x = self.features(x)
-        x = self.avgpool(x)
-        x = x.view(x.size(0), -1)
-        x = self.classifier(x)
-        return x
-
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, 0, 0.01)
-                nn.init.constant_(m.bias, 0)
-
-
-def make_layers(cfg, batch_norm=False):
-    layers = []
-    in_channels = 2
-    for v in cfg:
-        if v == 'M':
-            layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
-        else:
-            conv2d = nn.Conv2d(in_channels, v, kernel_size=3, padding=1)
-            if batch_norm:
-                layers += [conv2d, nn.BatchNorm2d(v), nn.ReLU(inplace=True)]
-            else:
-                layers += [conv2d, nn.ReLU(inplace=True)]
-            in_channels = v
-    return nn.Sequential(*layers)
-
-cfgs = {
-    'A': [64, 'M', 128, 'M', 256, 256, 'M', 512, 512, 'M', 512, 512, 'M'],
-    'B': [64, 64, 'M', 128, 128, 'M', 256, 256, 'M', 512, 512, 'M', 512, 512, 'M'],
-    'D': [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 'M', 512, 512, 512, 'M', 512, 512, 512, 'M'],
-    'E': [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 256, 'M', 512, 512, 512, 512, 'M', 512, 512, 512, 512, 'M'],
-}
-
-def _vgg(arch, cfg, batch_norm, pretrained, progress, **kwargs):
-    model = VGG(make_layers(cfgs[cfg], batch_norm=batch_norm), **kwargs)
-    return model
-
-def vgg16(pretrained=False, progress=True, **kwargs):
-    """VGG 16-layer model (configuration "D")
-
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-        progress (bool): If True, displays a progress bar of the download to stderr
-    """
-    return _vgg('vgg16', 'D', False, pretrained, progress, **kwargs)
-
-  
-class VGG16(nn.Module):
-    
-    def __init__(self, n_layers, usegpu=True):
-        super(VGG16,self).__init__()
-        
-        self.cnn = vgg16(pretrained=False)
-        self.cnn = nn.Sequential(*list(self.cnn.children())[0])
-        self.cnn = nn.Sequential(*list(self.cnn.children())[:n_layers])
-        
-    def __get_outputs(self,x):
-        
-        outputs = []
-        for i, layer in enumerate(self.cnn.children()):
-            x = layer(x)
-            outputs.append(x)
-            
-        return outputs
-    
-    def forward(self,x):
-        outputs = self.__get_outputs(x)
-        
-        return outputs[-1]
-   
-    
-class SkipVGG16(nn.Module):
-    
-    def __init__(self, usegpu=True):
-        super(SkipVGG16, self).__init__()
-        
-        self.outputs = [3,8]
-        self.n_filters = [64,128]
-        
-        self.model = VGG16(n_layers=16, usegpu=usegpu)
-        
-    def forward(self,x):
-        
-        out = []
-        for i, layer in enumerate(list(self.model.children())[0]):
-            x = layer(x)
-            if i in self.outputs:
-                out.append(x)
-        out.append(x)
-        
-        return out
-    
-    
-class ReNet(nn.Module):
-    
-    def __init__(self, n_input, n_units, patch_size=(1, 1), usegpu=True):
-        super(ReNet, self).__init__()
-        
-        self.usegpu=usegpu
-        
-        self.patch_size_height = int(patch_size[0])
-        self.patch_size_width = int(patch_size[1])
-        
-        assert self.patch_size_height >= 1
-        assert self.patch_size_width >= 1
-        
-        self.tiling = False if ((self.patch_size_height == 1) and (
-            self.patch_size_width == 1)) else True
-                
-        rnn_hor_n_inputs = n_input * self.patch_size_height * \
-            self.patch_size_width
-            
-        self.rnn_hor = nn.GRU(rnn_hor_n_inputs, n_units,
-                              num_layers=1, batch_first=True,
-                              bidirectional=True)
-        
-        self.rnn_ver = nn.GRU(n_units * 2, n_units,
-                              num_layers=1, batch_first=True,
-                              bidirectional=True)
-        
-    def __tile(self,x):
-
-        if (x.size(2) % self.patch_size_height) == 0:
-            n_height_padding = 0
-        else:
-            n_height_padding = self.patch_size_height - \
-                x.size(2) % self.patch_size_height
-        if (x.size(3) % self.patch_size_width) == 0:
-            n_width_padding = 0
-        else:
-            n_width_padding = self.patch_size_width - \
-                x.size(3) % self.patch_size_width
-
-        n_top_padding = n_height_padding / 2
-        n_bottom_padding = n_height_padding - n_top_padding
-
-        n_left_padding = n_width_padding / 2
-        n_right_padding = n_width_padding - n_left_padding
-
-        x = F.pad(x, (n_left_padding, n_right_padding,
-                      n_top_padding, n_bottom_padding))
-
-        b, n_filters, n_height, n_width = x.size()
-
-        assert n_height % self.patch_size_height == 0
-        assert n_width % self.patch_size_width == 0
-
-        new_height = n_height / self.patch_size_height
-        new_width = n_width / self.patch_size_width
-
-        x = x.view(b, n_filters, new_height, self.patch_size_height,
-                   new_width, self.patch_size_width)
-        x = x.permute(0, 2, 4, 1, 3, 5)
-        x = x.contiguous()
-        x = x.view(b, new_height, new_width, self.patch_size_height *
-                   self.patch_size_width * n_filters)
-        x = x.permute(0, 3, 1, 2)
-        x = x.contiguous()
-
-        return x
-                
-    def __swap_hw(self, x):
-
-        # x : b, nf, h, w
-        x = x.permute(0, 1, 3, 2)
-        x = x.contiguous()
-        #  x : b, nf, w, h
-
-        return x
-    
-    def rnn_forward(self, x, hor_or_ver):
-
-        # x : b, nf, h, w
-        assert hor_or_ver in ['hor', 'ver']
-
-        if hor_or_ver == 'ver':
-            x = self.__swap_hw(x)
-
-        x = x.permute(0, 2, 3, 1)
-        x = x.contiguous()
-        b, n_height, n_width, n_filters = x.size()
-        # x : b, h, w, nf
-
-        x = x.view(b * n_height, n_width, n_filters)
-        # x : b * h, w, nf
-        if hor_or_ver == 'hor':
-            x, _ = self.rnn_hor(x)
-        elif hor_or_ver == 'ver':
-            x, _ = self.rnn_ver(x)
-            
-        x = x.contiguous()
-        x = x.view(b, n_height, n_width, -1)
-        # x : b, h, w, nf
-
-        x = x.permute(0, 3, 1, 2)
-        x = x.contiguous()
-        # x : b, nf, h, w
-
-        if hor_or_ver == 'ver':
-            x = self.__swap_hw(x)
-
-        return x
-    
-    def forward(self, x):
-
-        # x : b, nf, h, w
-        if self.tiling:
-            x = self.__tile(x)
-
-        x = self.rnn_forward(x, 'hor')
-        x = self.rnn_forward(x, 'ver')
-
-        return x
-        
-
-class ReSeg(nn.Module):
-    
-    def __init__(self, usegpu=True):
-        super(ReSeg, self).__init__()
-        
-        self.cnn = SkipVGG16(usegpu=usegpu)
-        
-        self.renet1 = ReNet(256, 100, usegpu=usegpu)
-        self.renet2 = ReNet(200, 100, usegpu=usegpu)
-        
-        self.upsampling1 = nn.ConvTranspose2d(200, 100,
-                                              kernel_size=2,stride=2)
-        self.relu1 = nn.ReLU()
-        self.upsampling2 = nn.ConvTranspose2d(100 + self.cnn.n_filters[1], 100,
-                                              kernel_size=2,stride=2)
-        self.relu2 = nn.ReLU()
-        
-        self.final = nn.Conv2d(
-                                in_channels = 100 + self.cnn.n_filters[0], 
-                                out_channels = 1,
-                                kernel_size=1,stride=1)
-        
-    def forward(self, x):
-        
-        first_skip, second_skip, x_enc = self.cnn(x)
-        x_enc = self.renet1(x_enc)
-        x_enc = self.renet2(x_enc)
-        x_dec = self.relu1(self.upsampling1(x_enc))
-        x_dec = torch.cat((x_dec, second_skip), dim=1)
-        x_dec = self.relu2(self.upsampling2(x_dec))
-        x_dec = torch.cat((x_dec, first_skip), dim=1)
-        x_out = self.final(x_dec)
-        
-        return x_out
-
-class VGG(nn.Module):
-    
-    def __init__(self, features, num_classes=1000, init_weights=True):
-        super(VGG, self).__init__()
-        self.features = features
-        self.avgpool = nn.AdaptiveAvgPool2d((7, 7))
-        self.classifier = nn.Sequential(
-            nn.Linear(512 * 7 * 7, 4096),
-            nn.ReLU(True),
-            nn.Dropout(),
-            nn.Linear(4096, 4096),
-            nn.ReLU(True),
-            nn.Dropout(),
-            nn.Linear(4096, num_classes),
-        )
-        if init_weights:
-            self._initialize_weights()
-
-    def forward(self, x):
-        x = self.features(x)
-        x = self.avgpool(x)
-        x = x.view(x.size(0), -1)
-        x = self.classifier(x)
-        return x
-
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, 0, 0.01)
-                nn.init.constant_(m.bias, 0)
-
-
-def make_layers(cfg, batch_norm=False):
-    layers = []
-    in_channels = 2
-    for v in cfg:
-        if v == 'M':
-            layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
-        else:
-            conv2d = nn.Conv2d(in_channels, v, kernel_size=3, padding=1)
-            if batch_norm:
-                layers += [conv2d, nn.BatchNorm2d(v), nn.ReLU(inplace=True)]
-            else:
-                layers += [conv2d, nn.ReLU(inplace=True)]
-            in_channels = v
-    return nn.Sequential(*layers)
-
-cfgs = {
-    'A': [64, 'M', 128, 'M', 256, 256, 'M', 512, 512, 'M', 512, 512, 'M'],
-    'B': [64, 64, 'M', 128, 128, 'M', 256, 256, 'M', 512, 512, 'M', 512, 512, 'M'],
-    'D': [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 'M', 512, 512, 512, 'M', 512, 512, 512, 'M'],
-    'E': [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 256, 'M', 512, 512, 512, 512, 'M', 512, 512, 512, 512, 'M'],
-}
-
-def _vgg(arch, cfg, batch_norm, pretrained, progress, **kwargs):
-    model = VGG(make_layers(cfgs[cfg], batch_norm=batch_norm), **kwargs)
-    return model
-
-def vgg16(pretrained=False, progress=True, **kwargs):
-    """VGG 16-layer model (configuration "D")
-
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-        progress (bool): If True, displays a progress bar of the download to stderr
-    """
-    return _vgg('vgg16', 'D', False, pretrained, progress, **kwargs)
-
-  
-class VGG16(nn.Module):
-    
-    def __init__(self, n_layers, usegpu=True):
-        super(VGG16,self).__init__()
-        
-        self.cnn = vgg16(pretrained=False)
-        self.cnn = nn.Sequential(*list(self.cnn.children())[0])
-        self.cnn = nn.Sequential(*list(self.cnn.children())[:n_layers])
-        
-    def __get_outputs(self,x):
-        
-        outputs = []
-        for i, layer in enumerate(self.cnn.children()):
-            x = layer(x)
-            outputs.append(x)
-            
-        return outputs
-    
-    def forward(self,x):
-        outputs = self.__get_outputs(x)
-        
-        return outputs[-1]
-  
-    
-class ReNet(nn.Module):
-    
-    def __init__(self, n_input, n_units, patch_size=(1, 1), usegpu=True):
-        super(ReNet, self).__init__()
-        
-        self.usegpu=usegpu
-        
-        self.patch_size_height = int(patch_size[0])
-        self.patch_size_width = int(patch_size[1])
-        
-        assert self.patch_size_height >= 1
-        assert self.patch_size_width >= 1
-        
-        self.tiling = False if ((self.patch_size_height == 1) and (
-            self.patch_size_width == 1)) else True
-                
-        rnn_hor_n_inputs = n_input * self.patch_size_height * \
-            self.patch_size_width
-            
-        self.rnn_hor = nn.GRU(rnn_hor_n_inputs, n_units,
-                              num_layers=1, batch_first=True,
-                              bidirectional=True)
-        
-        self.rnn_ver = nn.GRU(n_units * 2, n_units,
-                              num_layers=1, batch_first=True,
-                              bidirectional=True)
-        
-    def __tile(self,x):
-
-        if (x.size(2) % self.patch_size_height) == 0:
-            n_height_padding = 0
-        else:
-            n_height_padding = self.patch_size_height - \
-                x.size(2) % self.patch_size_height
-        if (x.size(3) % self.patch_size_width) == 0:
-            n_width_padding = 0
-        else:
-            n_width_padding = self.patch_size_width - \
-                x.size(3) % self.patch_size_width
-
-        n_top_padding = n_height_padding / 2
-        n_bottom_padding = n_height_padding - n_top_padding
-
-        n_left_padding = n_width_padding / 2
-        n_right_padding = n_width_padding - n_left_padding
-
-        x = F.pad(x, (n_left_padding, n_right_padding,
-                      n_top_padding, n_bottom_padding))
-
-        b, n_filters, n_height, n_width = x.size()
-
-        assert n_height % self.patch_size_height == 0
-        assert n_width % self.patch_size_width == 0
-
-        new_height = n_height / self.patch_size_height
-        new_width = n_width / self.patch_size_width
-
-        x = x.view(b, n_filters, new_height, self.patch_size_height,
-                   new_width, self.patch_size_width)
-        x = x.permute(0, 2, 4, 1, 3, 5)
-        x = x.contiguous()
-        x = x.view(b, new_height, new_width, self.patch_size_height *
-                   self.patch_size_width * n_filters)
-        x = x.permute(0, 3, 1, 2)
-        x = x.contiguous()
-
-        return x
-                
-    def __swap_hw(self, x):
-
-        # x : b, nf, h, w
-        x = x.permute(0, 1, 3, 2)
-        x = x.contiguous()
-        #  x : b, nf, w, h
-
-        return x
-    
-    def rnn_forward(self, x, hor_or_ver):
-
-        # x : b, nf, h, w
-        assert hor_or_ver in ['hor', 'ver']
-
-        if hor_or_ver == 'ver':
-            x = self.__swap_hw(x)
-
-        x = x.permute(0, 2, 3, 1)
-        x = x.contiguous()
-        b, n_height, n_width, n_filters = x.size()
-        # x : b, h, w, nf
-
-        x = x.view(b * n_height, n_width, n_filters)
-        # x : b * h, w, nf
-        if hor_or_ver == 'hor':
-            x, _ = self.rnn_hor(x)
-        elif hor_or_ver == 'ver':
-            x, _ = self.rnn_ver(x)
-            
-        x = x.contiguous()
-        x = x.view(b, n_height, n_width, -1)
-        # x : b, h, w, nf
-
-        x = x.permute(0, 3, 1, 2)
-        x = x.contiguous()
-        # x : b, nf, h, w
-
-        if hor_or_ver == 'ver':
-            x = self.__swap_hw(x)
-
-        return x
-    
-    def forward(self, x):
-
-        # x : b, nf, h, w
-        if self.tiling:
-            x = self.__tile(x)
-
-        x = self.rnn_forward(x, 'hor')
-        x = self.rnn_forward(x, 'ver')
-
-        return x
-
-
-class ConvGRUCell(nn.Module):
-    
-    def __init__(self, input_size, hidden_size, kernel_size, usegpu=True):
-        super(ConvGRUCell, self).__init__()
-        
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.kernel_size = kernel_size
-        self.usegpu = usegpu
-        
-        _n_inputs = self.input_size + self.hidden_size
-        self.conv_gates = nn.Conv2d(_n_inputs,
-                                    2 * self.hidden_size,
-                                    self.kernel_size,
-                                    padding=self.kernel_size // 2)
-
-        self.conv_ct = nn.Conv2d(_n_inputs, self.hidden_size,
-                                 self.kernel_size,
-                                 padding=self.kernel_size // 2)
-        
-    def forward(self, x, hidden):
-        
-        batch_size, _, height, width = x.size()
-        
-        if hidden is None:
-            size_h = [batch_size, self.hidden_size, height, width]
-            hidden = Variable(torch.zeros(size_h))
-
-            if self.usegpu:
-                hidden = hidden.cuda()
-                
-        c1 = self.conv_gates(torch.cat((x, hidden), dim=1))
-        rt, ut = c1.chunk(2, 1)
-
-        reset_gate = torch.sigmoid(rt)
-        update_gate = torch.sigmoid(ut)
-
-        gated_hidden = torch.mul(reset_gate, hidden)
-
-        ct = torch.tanh(self.conv_ct(torch.cat((x, gated_hidden), dim=1)))
-
-        next_h = torch.mul(update_gate, hidden) + (1 - update_gate) * ct
-
-        return next_h
-    
-
-class RecurrentHourglass(nn.Module):
-    
-    def __init__(self, input_n_filters, hidden_n_filters, kernel_size,
-                 n_levels, embedding_size, usegpu=True):
-        super(RecurrentHourglass, self).__init__()
-            
-        assert n_levels >= 1
-    
-        self.input_n_filters = input_n_filters
-        self.hidden_n_filters = hidden_n_filters
-        self.kernel_size = kernel_size
-        self.n_levels = n_levels
-        self.embedding_size = embedding_size
-        self.usegpu = usegpu
-        
-        self.convgru_cell = ConvGRUCell(self.hidden_n_filters,
-                                        self.hidden_n_filters,
-                                        self.kernel_size,
-                                        self.usegpu)
-        
-        self.__generate_pre_post_convs()
-        
-    def __generate_pre_post_convs(self):
-        
-        def __get_conv(input_n_filters, output_n_filters):
-            return nn.Conv2d(input_n_filters, output_n_filters,
-                             self.kernel_size,
-                             padding=self.kernel_size // 2)
-            
-        self.pre_conv_layers = [__get_conv(self.input_n_filters,
-                                           self.hidden_n_filters), ]
-    
-        for _ in range(self.n_levels - 1):
-            self.pre_conv_layers.append(__get_conv(self.hidden_n_filters,
-                                                   self.hidden_n_filters))
-        self.pre_conv_layers = nn.ModuleList(self.pre_conv_layers)
-    
-        self.post_conv_layers = [__get_conv(self.hidden_n_filters,
-                                            self.embedding_size), ]
-        for _ in range(self.n_levels - 1):
-            self.post_conv_layers.append(__get_conv(self.hidden_n_filters,
-                                                    self.hidden_n_filters))
-        self.post_conv_layers = nn.ModuleList(self.post_conv_layers)
-    
-    def forward_encoding(self, x):
-        
-        convgru_outputs = []
-        hidden = None
-        for i in range(self.n_levels):
-            x = F.relu(self.pre_conv_layers[i](x))
-            hidden = self.convgru_cell(x, hidden)
-            convgru_outputs.append(hidden)
-            
-        return convgru_outputs
-    
-    def forward_decoding(self, convgru_outputs):
-        
-        _last_conv_layer = self.post_conv_layers[self.n_levels - 1]
-        _last_output = convgru_outputs[self.n_levels - 1]
-        
-        post_feature_map = F.relu(_last_conv_layer(_last_output))
-        for i in range(self.n_levels - 1)[::-1]:
-            post_feature_map += convgru_outputs[i]
-            post_feature_map = self.post_conv_layers[i](post_feature_map)
-            post_feature_map = F.relu(post_feature_map)
-            
-        return post_feature_map
-    
-    def forward(self, x):
-        
-        x = self.forward_encoding(x)
-        x = self.forward_decoding(x)
-        
-        return x
-    
-
-class StackedRecurrentHourglass(nn.Module):
-    
-    def __init__(self, usegpu=True):
-        super(StackedRecurrentHourglass, self).__init__()
-        
-        self.usegpu = usegpu
-        
-        self.base_cnn = self.__generate_base_cnn()
-        
-        self.enc_stacked_hourglass = self.__generate_enc_stacked_hg(64,3)
-        
-        self.stacked_renet = self.__generate_stacked_renet(64,2)
-        
-        self.decoder = self.__generate_decoder(64)
-        
-    def __generate_base_cnn(self):
-        
-        base_cnn = VGG16(n_layers=4, usegpu=self.usegpu)
-        
-        return base_cnn
-    
-    def __generate_enc_stacked_hg(self, input_n_filters, n_levels):
-        
-        stacked_hourglass = nn.Sequential()
-        stacked_hourglass.add_module('Hourglass_1',
-                                     RecurrentHourglass(
-                                         input_n_filters=input_n_filters,
-                                         hidden_n_filters=64,
-                                         kernel_size=3,
-                                         n_levels=n_levels,
-                                         embedding_size=64,
-                                         usegpu=self.usegpu))
-        stacked_hourglass.add_module('pool_1',
-                                     nn.MaxPool2d(2, stride=2))
-        stacked_hourglass.add_module('Hourglass_2',
-                                     RecurrentHourglass(
-                                         input_n_filters=64,
-                                         hidden_n_filters=64,
-                                         kernel_size=3,
-                                         n_levels=n_levels,
-                                         embedding_size=64,
-                                         usegpu=self.usegpu))        
-        stacked_hourglass.add_module('pool_2',
-                                     nn.MaxPool2d(2, stride=2))    
-
-        return stacked_hourglass
-
-    def __generate_stacked_renet(self, input_n_filters, n_renets):
-
-        assert n_renets >= 1
-        
-        renet = nn.Sequential()
-        renet.add_module('ReNet_1', ReNet(input_n_filters, 32,
-                                          patch_size=(1, 1),
-                                          usegpu=self.usegpu))
-        for i in range(1, n_renets):
-            renet.add_module('ReNet_{}'.format(i + 1),
-                             ReNet(32 * 2, 32, patch_size=(1, 1),
-                                   usegpu=self.usegpu))
-            
-        return renet
-    
-    def __generate_decoder(self, input_n_filters):
-        
-        decoder = nn.Sequential()
-        decoder.add_module('ConvTranspose_1',
-                           nn.ConvTranspose2d(input_n_filters,
-                                              64,
-                                              kernel_size=(2, 2),
-                                              stride=(2, 2)))
-        decoder.add_module('ReLU_1', nn.ReLU())
-        decoder.add_module('ConvTranspose_2',
-                           nn.ConvTranspose2d(64,
-                                              64,
-                                              kernel_size=(2, 2),
-                                              stride=(2, 2)))
-        decoder.add_module('ReLU_2', nn.ReLU())
-        decoder.add_module('Final',
-                           nn.ConvTranspose2d(64,
-                                              1,
-                                              kernel_size=(1, 1),
-                                              stride=(1, 1)))
-        
-        return decoder
-            
-    def forward(self, x):
-        
-        x = self.base_cnn(x)
-        x = self.enc_stacked_hourglass(x)
-        x = self.stacked_renet(x)
-        x = self.decoder(x)
-        
-        return x
-
-"""# choose"""
-
-#net = Unet().to(device)
-net = ReSeg().to(device)
+net = Unet().to(device)
+#net = ReSeg().to(device)
 #net = StackedRecurrentHourglass().to(device)
+
+#print(sum(p.numel() for p in net.parameters() if p.requires_grad))
 
 """# load data"""
 
@@ -918,7 +64,10 @@ def load_data_hdf(iphi):
   i_f = hf_f['i_f'][iphi]
   e_df = hf_df['e_df'][iphi] 
   i_df = hf_df['i_df'][iphi]
-  
+ 
+  hf_f.close()
+  hf_df.close()
+ 
   ind1,ind2,ind3 = i_f.shape
  #change lim back to ind2 if want full set 
   f = np.zeros([lim,2,ind1,ind1])
@@ -942,19 +91,29 @@ def load_data_hdf(iphi):
   f[neg_f_inds] = 0
   
   # find where df is 0
-  zero_df_inds = np.where(np.einsum('ijkl -> i',df) == 0)
+  zero_df_inds = np.where(np.einsum('ijkl -> i',np.abs(df)) < 1)
   zero_df_inds = list(zero_df_inds[0]) 
- 
+
+  fid = open('bad_inds.txt','w')
+  for ind in zero_df_inds:
+    fid.write(str(ind)+'\n') 
+  fid.close()   
+
   df+=f
 
   # instantiate variables for conservation properties and for normalization
   hf_cons = h5py.File(datapath+run_num+'hdf_cons_fullvol.h5','r')
-  hf_vol = h5py.File(datapath+run_num+'hdf_vol.h5')
+  hf_vol = h5py.File(datapath+run_num+'hdf_vol.h5','r')
   cons = conservation_variables(hf_cons,hf_vol)
-  
+ 
+  hf_cons.close()
+  hf_vol.close()
+ 
   hf_stats = h5py.File(datapath+run_num+'hdf_stats.h5','r')
   zvars = stats_variables(hf_stats)
   
+  hf_stats.close()
+
   for n in range(lim):
     f[n] = (f[n]-zvars.mean_f)/zvars.std_f
 #     df[n] = (df[n]-zvars.mean_df)/zvars.std_df
@@ -1050,7 +209,22 @@ def split_data(f,df,cons,num_nodes,bad_inds):
     f_train = f[train_inds]
     f_val = f[val_inds]
     f_test = f[test_inds]
-        
+    
+
+    # write out indices for running validation and tests
+    fid_inds = open('inds.txt','w')
+
+    fid_inds.write('train\n')
+    for tr in train_inds:
+      fid_inds.write(str(tr)+'\n')
+    fid_inds.write('val\n')
+    for v in val_inds:
+      fid_inds.write(str(v)+'\n')
+    fid_inds.write('test\n')
+    for te in test_inds:
+      fid_inds.write(str(te)+'\n')
+    fid_inds.close()
+    
     del f  
       
     df_train = df[train_inds]
@@ -1189,8 +363,8 @@ def check_properties_main(f,df,temp,vol,cons):
 
 def train(trainloader,valloader,sp_flag,epoch,end,zvars,cons):
   
-    props_before = []
-    props_after = []
+    props_xgc = []
+    props_ml = []
     train_loss_vector = []
     l2_loss_vector = []
     cons_loss_vector = []
@@ -1229,47 +403,23 @@ def train(trainloader,valloader,sp_flag,epoch,end,zvars,cons):
         
         # concatenate with actual dfe
         outputs_nof = torch.cat((targets_nof_to_cat,outputs_nof_to_cat),1)
-                  
-        # updated calls to check_properties with correct arguments  
-        masse_b,massi_b,mom_b,energy_b = check_properties_main(data_unnorm[:,:,:,:-1],\
-                                                               targets_nof[:,:,:,:-1],temp,vol,cons)
 
-        masse_a,massi_a,mom_a,energy_a = check_properties_main(data_unnorm[:,:,:,:-1],\
-                                                               outputs_nof[:,:,:,:-1],temp,vol,cons)
-                       
-#        props_before.append([(torch.sum(massi_b+masse_b)/nbatch).item(),\
-#                             (torch.sum(mom_b)/nbatch).item(),\
-#                             (torch.sum(energy_b)/nbatch).item()])
-#        props_after.append([torch.sum((massi_a+massi_b)/nbatch).item(),\
-#                             torch.sum((mom_a)/nbatch).item(),\
-#                             torch.sum((energy_a)/nbatch).item()])
-      
-        masse_loss = torch.sum(masse_a)/nbatch
-        massi_loss = torch.sum(massi_a)/nbatch
-        mom_loss = torch.sum(mom_a)/nbatch
-        energy_loss = torch.sum(energy_a)/nbatch
+        masse_xgc,massi_xgc,mom_xgc,energy_xgc = check_properties_main(data_unnorm[:,:,:,:-1],\
+                                                                       targets_nof[:,:,:,:-1],temp,vol,cons)
+        masse_ml,massi_ml,mom_ml,energy_ml = check_properties_main(data_unnorm[:,:,:,:-1],\
+                                                                   outputs_nof[:,:,:,:-1],temp,vol,cons)
+        
+	# only use ml properties for loss - keep track of xgc properties for comparison later 
+        masse_loss = torch.sum(masse_ml)/nbatch
+        massi_loss = torch.sum(massi_ml)/nbatch
+        mom_loss = torch.sum(mom_ml)/nbatch
+        energy_loss = torch.sum(energy_ml)/nbatch
 
-        #masse_loss = torch.sum(torch.abs(masse_a - masse_b)).float()/nbatch
-        #massi_loss = torch.sum(torch.abs(massi_a - massi_b)).float()/nbatch
-        #mass_loss = massi_loss + masse_loss
-        #mom_loss = torch.sum(torch.abs(mom_a - mom_b)).float()/nbatch
-        #energy_loss = torch.sum(torch.abs(energy_a - energy_b)).float()/nbatch    
-                
         l2_loss = criterion(outputs[:,0],targets[:,1])      
         
         if i % 100 == 99:
             print('masse',masse_loss.item(),'massi',massi_loss.item(),'mom',mom_loss.item(),'en',energy_loss.item(),'l2',l2_loss.item())
-                
               
-#        loss = l2_loss*loss_weights[0] \
-#             + mass_loss*loss_weights[1] \
-#             + mom_loss*loss_weights[2] \
-#             + energy_loss*loss_weights[3]    
-        
-#        cons_loss = mass_loss*loss_weights[1] \
-#                  + mom_loss*loss_weights[2] \
-#                  + energy_loss*loss_weights[3] \
-
         loss = l2_loss*loss_weights[0]\
              + masse_loss*loss_weights[1]\
              + massi_loss*loss_weights[2]\
@@ -1297,9 +447,6 @@ def train(trainloader,valloader,sp_flag,epoch,end,zvars,cons):
             print('      L2 loss: %.6f' % (running_l2_loss / output_rate))
             print('      conservation loss: %.6f' % (running_cons_loss / output_rate))
            
-#             print('outputs',mass_a[0].item(),mom_a[0].item(),energy_a[0].item())
-#             print('targets',mass_b[0].item(),mom_b[0].item(),energy_b[0].item())
-          
         if i % plot_rate == plot_rate-1:
             train_loss_vector.append(running_loss / output_rate)
             l2_loss_vector.append(running_l2_loss / output_rate)
@@ -1309,14 +456,15 @@ def train(trainloader,valloader,sp_flag,epoch,end,zvars,cons):
             running_cons_loss = 0.0
             #plot_df(targets_unnorm[0,0,:,:-1],outputs_unnorm[0,0,:,:-1],epoch)
             
-                    
-            props_before.append([(torch.sum(massi_b+masse_b)/nbatch).item(),\
-                                 (torch.sum(mom_b)/nbatch).item(),\
-                                 (torch.sum(energy_b)/nbatch).item()])
-            props_after.append([torch.sum((massi_a+massi_b)/nbatch).item(),\
-                                torch.sum((mom_a)/nbatch).item(),\
-                                torch.sum((energy_a)/nbatch).item()])
+            props_xgc.append([torch.sum((masse_xgc)/nbatch).item(),\
+                             torch.sum((massi_xgc)/nbatch).item(),\
+                             torch.sum((mom_xgc)/nbatch).item(),\
+                             torch.sum((energy_xgc)/nbatch).item()])
 
+            props_ml.append([torch.sum((masse_ml)/nbatch).item(),\
+                             torch.sum((massi_ml)/nbatch).item(),\
+                             torch.sum((mom_ml)/nbatch).item(),\
+                             torch.sum((energy_ml)/nbatch).item()])
 
         if i % val_rate == val_rate-1:         
           val_loss = validate(valloader,cons,zvars)
@@ -1337,9 +485,7 @@ def train(trainloader,valloader,sp_flag,epoch,end,zvars,cons):
         timestart = timeit.default_timer()  
     end += i + 1
     
-    cons_array = np.concatenate((np.array(props_before),np.array(props_after)),axis=1)
-#    cons_array = np.einsum('ij -> j',cons_array)
-#    cons_array = np.expand_dims(cons_array,0)    
+    cons_array = np.concatenate((np.array(props_xgc),np.array(props_xgc)),axis=1)
  
     return train_loss_vector, l2_loss_vector, cons_loss_vector, val_loss_vector, cons_array, end
 
@@ -1374,14 +520,13 @@ def validate(valloader,cons,zvars):
       # concatenate with actual dfe
       outputs_nof = torch.cat((targets_nof_to_cat,outputs_nof_to_cat),1)
 
-      masse_b,massi_b,mom_b,energy_b = check_properties_main(data_unnorm[:,:,:,:-1],\
-                                                 targets_nof[:,:,:,:-1],temp,vol,cons) 
-      masse_a,massi_a,mom_a,energy_a = check_properties_main(data_unnorm[:,:,:,:-1],\
-                                                 outputs_nof[:,:,:,:-1],temp,vol,cons)  
-      masse_loss = torch.sum(masse_a)
-      massi_loss = torch.sum(massi_a)
-      mom_loss = torch.sum(mom_a)
-      energy_loss = torch.sum(energy_a)
+      masse_ml,massi_ml,mom_ml,energy_ml = check_properties_main(data_unnorm[:,:,:,:-1],\
+                                                                 outputs_nof[:,:,:,:-1],temp,vol,cons)  
+
+      masse_loss = torch.sum(masse_ml)/nbatch
+      massi_loss = torch.sum(massi_ml)/nbatch
+      mom_loss = torch.sum(mom_ml)/nbatch
+      energy_loss = torch.sum(energy_ml)/nbatch
                 
       l2_loss = criterion(outputs[:,0],targets[:,1])  
                   
@@ -1390,19 +535,6 @@ def validate(valloader,cons,zvars):
             + massi_loss*loss_weights[2]\
             + mom_loss*loss_weights[3]\
     	    + energy_loss*loss_weights[4]    
-  
-#      masse_loss = torch.sum(torch.abs(masse_a - masse_b)).float()/nbatch
-#      massi_loss = torch.sum(torch.abs(massi_a - massi_b)).float()/nbatch
-#      mass_loss = massi_loss + masse_loss
-#      mom_loss = torch.sum(torch.abs(mom_a - mom_b)).float()/nbatch
-#      energy_loss = torch.sum(torch.abs(energy_a - energy_b)).float()/nbatch   
-     
-#      l2_loss = criterion(outputs[:,0],targets[:,1])  
-      
-#      loss = l2_loss*loss_weights[0] \
-#           + mass_loss*loss_weights[1] \
-#           + mom_loss*loss_weights[2] \
-#           + energy_loss*loss_weights[3] 
       
       running_loss += loss.item()
   
@@ -1415,7 +547,6 @@ def validate(valloader,cons,zvars):
 
 """# test"""
 
-# Commented out IPython magic to ensure Python compatibility.
 def test(f_test,df_test,temp_test,vol_test):
  
     testset = DistFuncDataset(f_test, df_test, temp_test, vol_test)
@@ -1423,12 +554,12 @@ def test(f_test,df_test,temp_test,vol_test):
     testloader = DataLoader(testset, batch_size=batch_size, 
                             shuffle=True, num_workers=4)
       
-    props_before = []
-    props_after = []
+    props_test_xgc = []
+    props_test_ml = []
     
-    l2_error=[]
-    lt1=0
-    gt1=0
+    l2_error = []
+    lt1 = 0
+    gt1 = 0
     with torch.no_grad():
         for (data, targets, temp, vol) in testloader:
 
@@ -1452,39 +583,28 @@ def test(f_test,df_test,temp_test,vol_test):
             # concatenate with actual dfe
             outputs_nof = torch.cat((targets_nof_to_cat,outputs_nof_to_cat),1)
   
-            props_before.append([torch.sum(each_prop).item()\
+            props_test_xgc.append([torch.sum(each_prop).item()\
                                  for each_prop in check_properties_main(data_unnorm[:,:,:,:-1],\
                                                                    targets_nof[:,:,:,:-1],temp,vol,cons)])         
-            props_after.append([torch.sum(each_prop).item()\
-                                for each_prop in check_properties_main(data_unnorm[:,:,:,:-1],\
-                                                                  outputs_nof[:,:,:,:-1],temp,vol,cons)])
+            props_test_ml.append([torch.sum(each_prop).item()\
+                                 for each_prop in check_properties_main(data_unnorm[:,:,:,:-1],\
+                                                                   outputs_nof[:,:,:,:-1],temp,vol,cons)])
                                 
-            loss = criterion(outputs, targets)
-            l2_error.append(loss.item()*100)
-            if loss.item()*100 < 1:
-                lt1+=1
-            else:
-                gt1+=1
+            l2_loss = criterion(outputs[:,0],targets[:,1])  
+            l2_error.append(l2_loss.item()*100)
     
-    cons_array = np.concatenate((np.array(props_before),np.array(props_after)),axis=1)
+    cons_test_array = np.concatenate((np.array(props_test_xgc),np.array(props_test_ml)),axis=1)
 
-    num_error = len(cons_array)
-    cons_error = np.zeros([3,num_error])
+    print('\nHighest L2: %.6f' % (max(l2_error)))
+    print('Lowest L2: %.6f' % (min(l2_error)))
+
+    print('\nConservation properties: \
+              \nXGC:\n   mass_e: %.6f \n   mass_i: %.6f \n   momentum: %.6f \n   energy: %.6f  \
+              \nML:\n   mass_e: %.6f \n   mass_i: %.6f \n   momentum: %.6f \n   energy: %.6f ' % ( \
+              max(cons_test_array[:,0]),max(cons_test_array[:,1]),max(cons_test_array[:,2]),max(cons_test_array[:,3]), \
+              max(cons_test_array[:,4]),max(cons_test_array[:,5]),max(cons_test_array[:,6]),max(cons_test_array[:,7])))
     
-    cons_error[0] = np.abs(((cons_array[:,4]+cons_array[:,5])-(cons_array[:,0]+cons_array[:,1]))/(cons_array[:,0]+cons_array[:,1]))
-    cons_error[1] = np.abs((cons_array[:,6]-cons_array[:,2])/cons_array[:,2])
-    cons_error[2] = np.abs((cons_array[:,7]-cons_array[:,3])/cons_array[:,3])
-    
-    print('Finished testing')
-    print('Percentage with MSE<1: %d %%' % (
-            100 * lt1/(lt1+gt1)))
-    print('Percent error in conservation properties:\nmass: \
-#             %d %%\nmomentum: %d %%\nenergy: %d %%' % ( 
-            100*cons_error[0].max(), 
-            100*cons_error[1].max(), 
-            100*cons_error[2].max()))
-    
-    return l2_error, cons_error, props_after
+    return None
 
 def save_checkpoint(state, is_best, lr, filename='checkpoint.pth.tar'): 
 #   torch.save(state,'/content/checkpoints/'+str(lr)+'/'+filename)
@@ -1531,9 +651,6 @@ start = timeit.default_timer()
 criterion = nn.MSELoss()
 
 optimizer = optim.SGD(net.parameters(), lr=lr, momentum=momentum)
-
-for group in optimizer.param_groups:
-  group['lr'] = 1e-9
 
 #optimizer = RAdam(net.parameters(), lr=lr)
 scheduler = optim.lr_scheduler.StepLR(optimizer,step_size=step_size,gamma=lr_decay)
@@ -1633,7 +750,7 @@ for epoch in range(num_epochs):
   for i in range(curr_iter):
     fid_loss1.write(str(train_loss[i])+'\n')
     fid_loss3.write(str(l2_loss[i])+'\n')
-    fid_loss4.write(str(cons_loss[i])+' '+str(cons_array[i,3])+' '+str(cons_array[i,4])+' '+str(cons_array[i,5])+'\n')
+    fid_loss4.write(str(cons_loss[i])+' '+str(cons_array[i,4])+' '+str(cons_array[i,5])+' '+str(cons_array[i,6])+'\n')
   for j in range(curr_val_iter): 
     fid_loss2.write(str(val_loss[j])+'\n')
   fid_lr.write(str(lr_epoch)+'\n')
@@ -1653,12 +770,13 @@ for epoch in range(num_epochs):
   #plt.show()
   
   epoch2 = timeit.default_timer()
-  scheduler.step()
+  if epoch >= warmup_period:
+    scheduler.step()
   #scheduler.step(val_loss[-1])
   print('Epoch time: {}s\n'.format(epoch2-epoch1))
 
 print('Starting testing')
-l2_error_i, cons_error_i = test(f_all_test,df_all_test,temp_all_test,vol_all_test)
+test(f_all_test,df_all_test,temp_all_test,vol_all_test)
 print('Finished testing')
 
 stop = timeit.default_timer()
