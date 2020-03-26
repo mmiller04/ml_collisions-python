@@ -25,7 +25,7 @@ from matplotlib.tri import Triangulation
 
 dir = sys.argv[1]
 
-batch_size = 64
+batch_size = 128
 lr = 1e-5
 momentum = 0.99
 num_epochs = 100
@@ -34,14 +34,14 @@ percentage_val = 0
 lr_decay = 0.5
 step_size = 5
 # loss_weights = [1,1e0,1e21,1e15]
-loss_weights = [0,0.1,0.1,0.1,0.1]
-nphi = 1
+loss_weights = [1,0.5,0.5,0.5,0.5]
+nphi = 4
 plot_rate = 250
 output_rate = 500
 val_rate = 2000
 datapath = '/scratch/gpfs/marcoam/ml_collisions/data/xgc1/ti272_JET_heat_load/'
 run_num = '00094/'
-lim = 80000
+lim = 150000
 modelpath = '/home/marcoam/runs/'+str(dir)+'/checkpoint.pth.tar'
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1023,21 +1023,48 @@ class DistFuncDataset(Dataset):
             
         return a, b, c, d
 
+def get_inds():
+    
+    filename = '/home/marcoam/runs/'+str(dir)+'/inds.txt'
+    fid = open(filename,'r')
+
+    train_inds = []
+    val_inds = []
+    test_inds = []
+
+    train = False
+    val = False
+    test = False
+
+    for line in fid.readlines():
+      if line[:-1] == 'train':
+        train = True
+        val = False
+        test = False
+
+      if line[:-1] == 'val':
+        train = False
+        val = True
+        test = False
+
+      if line[:-1] == 'test':
+        train = False
+        val = False
+        test = True
+
+      if train == True and line[:-1] != 'train':
+        train_inds.append(int(line[:-1]))
+      elif val == True and line[:-1] != 'val':
+        val_inds.append(int(line[:-1]))
+      elif test == True and line[:-1] != 'test':
+        test_inds.append(int(line[:-1]))
+
+    return(train_inds,val_inds,test_inds)
+
 """# split data"""
 
-def split_data(f,df,cons,num_nodes):
+def split_data(f,df,cons,train_inds,val_inds,test_inds):
     
-    inds = np.arange(num_nodes)
-    #np.random.seed(0)
-    #np.random.shuffle(inds) 
-    
-    num_train = int(np.floor(percentage_train*num_nodes))
-    num_val = int(np.floor(percentage_val*num_nodes))
-    
-    train_inds = inds[:num_train]
-    val_inds = inds[num_train:num_train+num_val]
-    test_inds = inds[num_train+num_val:]
- 
     f_train = f[train_inds]
     f_val = f[val_inds]
     f_test = f[test_inds]
@@ -1070,8 +1097,13 @@ def split_data(f,df,cons,num_nodes):
                              shuffle=False, pin_memory=True, num_workers=4)
     
     del f_train, df_train, temp_train, vol_train
+   
+    valset = DistFuncDataset(f_val, df_val, temp_val, vol_val)
     
-    return trainloader, f_test, df_test, temp_test, vol_test
+    valloader = DataLoader(valset, batch_size=batch_size, 
+                           shuffle=True, pin_memory=True, num_workers=4)
+ 
+    return trainloader, valloader, f_test, df_test, temp_test, vol_test
 
 """# check props"""
 
@@ -1465,13 +1497,13 @@ def save_checkpoint(state, is_best, lr, filename='checkpoint.pth.tar'):
   if is_best:
     shutil.copy(filename, 'model_best.pth.tar')
 
-def test_load(trainloader,zvars,cons):
+def test_load(trainloader,valloader,zvars,cons):
  
-  fid1 = open('/home/marcoam/runs/'+str(dir)+'/masse.txt','a')
-  fid2 = open('/home/marcoam/runs/'+str(dir)+'/massi.txt','a')
-  fid3 = open('/home/marcoam/runs/'+str(dir)+'/mom.txt','a')
-  fid4 = open('/home/marcoam/runs/'+str(dir)+'/en.txt','a')
-  fid5 = open('/home/marcoam/runs/'+str(dir)+'/contour.txt','a')
+  fid1 = open('/home/marcoam/runs/'+str(dir)+'/vmasse.txt','a')
+  fid2 = open('/home/marcoam/runs/'+str(dir)+'/vmassi.txt','a')
+  fid3 = open('/home/marcoam/runs/'+str(dir)+'/vmom.txt','a')
+  fid4 = open('/home/marcoam/runs/'+str(dir)+'/ven.txt','a')
+  fid5 = open('/home/marcoam/runs/'+str(dir)+'/vcontour.txt','a')
   
   f_worst = {}
   s_worst = {}
@@ -1486,7 +1518,7 @@ def test_load(trainloader,zvars,cons):
   f_worst['dfml'] = 0
 
 #  for i in range(0):
-  for i, (data, targets, temp, vol) in enumerate(trainloader):	
+  for i, (data, targets, temp, vol) in enumerate(valloader):	
 #    print(i)    
     time1test = timeit.default_timer()
 
@@ -1563,11 +1595,11 @@ def test_load(trainloader,zvars,cons):
   fid4.close()
 
 # write 1st worst and 2nd worst
-  fid_f1 = open('/home/marcoam/runs/'+str(dir)+'/first_worst_fe.txt','w')
-  fid_f2 = open('/home/marcoam/runs/'+str(dir)+'/first_worst_fi.txt','w')
-  fid_f3 = open('/home/marcoam/runs/'+str(dir)+'/first_worst_dfxgc.txt','w')
-  fid_f4 = open('/home/marcoam/runs/'+str(dir)+'/first_worst_dfml.txt','w')
-  fid_f5 = open('/home/marcoam/runs/'+str(dir)+'/first_worst_info.txt','w')
+  fid_f1 = open('/home/marcoam/runs/'+str(dir)+'/vfirst_worst_fe.txt','w')
+  fid_f2 = open('/home/marcoam/runs/'+str(dir)+'/vfirst_worst_fi.txt','w')
+  fid_f3 = open('/home/marcoam/runs/'+str(dir)+'/vfirst_worst_dfxgc.txt','w')
+  fid_f4 = open('/home/marcoam/runs/'+str(dir)+'/vfirst_worst_dfml.txt','w')
+  fid_f5 = open('/home/marcoam/runs/'+str(dir)+'/vfirst_worst_info.txt','w')
  
   for line in f_worst['fe']: #fe
     for entry in line:
@@ -1588,11 +1620,11 @@ def test_load(trainloader,zvars,cons):
   fid_f5.write(str(f_worst['ind'])+'\n')
   fid_f5.write(str(f_worst['error'].item()))
   
-  fid_s1 = open('/home/marcoam/runs/'+str(dir)+'/second_worst_fe.txt','w')
-  fid_s2 = open('/home/marcoam/runs/'+str(dir)+'/second_worst_fi.txt','w')
-  fid_s3 = open('/home/marcoam/runs/'+str(dir)+'/second_worst_dfxgc.txt','w')
-  fid_s4 = open('/home/marcoam/runs/'+str(dir)+'/second_worst_dfml.txt','w')
-  fid_s5 = open('/home/marcoam/runs/'+str(dir)+'/second_worst_info.txt','w')
+  fid_s1 = open('/home/marcoam/runs/'+str(dir)+'/vsecond_worst_fe.txt','w')
+  fid_s2 = open('/home/marcoam/runs/'+str(dir)+'/vsecond_worst_fi.txt','w')
+  fid_s3 = open('/home/marcoam/runs/'+str(dir)+'/vsecond_worst_dfxgc.txt','w')
+  fid_s4 = open('/home/marcoam/runs/'+str(dir)+'/vsecond_worst_dfml.txt','w')
+  fid_s5 = open('/home/marcoam/runs/'+str(dir)+'/vsecond_worst_info.txt','w')
  
   for line in s_worst['fe']: #fe
     for entry in line:
@@ -1686,16 +1718,17 @@ for iphi in range(nphi):
   print('      Loading time: %.3fs' % (load2-load1))
 
   print('   Creating training set')
-  trainloader,f_test,df_test,temp_test,vol_test = split_data(f,df,cons,num_nodes)
+  train_inds,val_inds,test_inds = get_inds()
+  trainloader,valloader,f_test,df_test,temp_test,vol_test = split_data(f,df,cons,train_inds,val_inds,test_inds)
   del f,df
 
   print('   Running previously loaded model') 
-  fid1 = open('/home/marcoam/runs/'+str(dir)+'/masse.txt','w')
-  fid2 = open('/home/marcoam/runs/'+str(dir)+'/massi.txt','w')
-  fid3 = open('/home/marcoam/runs/'+str(dir)+'/mom.txt','w')
-  fid4 = open('/home/marcoam/runs/'+str(dir)+'/en.txt','w')
-  fid5 = open('/home/marcoam/runs/'+str(dir)+'/contour.txt','w')
-  test_load(trainloader,zvars,cons) 
+  fid1 = open('/home/marcoam/runs/'+str(dir)+'/vmasse.txt','w')
+  fid2 = open('/home/marcoam/runs/'+str(dir)+'/vmassi.txt','w')
+  fid3 = open('/home/marcoam/runs/'+str(dir)+'/vmom.txt','w')
+  fid4 = open('/home/marcoam/runs/'+str(dir)+'/ven.txt','w')
+  fid5 = open('/home/marcoam/runs/'+str(dir)+'/vcontour.txt','w')
+  test_load(trainloader,valloader,zvars,cons) 
  
    
 
