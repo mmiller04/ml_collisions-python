@@ -15,6 +15,7 @@ hf_f = h5py.File('/scratch/gpfs/marcoam/ml_collisions/data/xgc1/ti272_JET_heat_l
 hf_df = h5py.File('/scratch/gpfs/marcoam/ml_collisions/data/xgc1/ti272_JET_heat_load/00094/hdf_df.h5','r')
 
 nphi,nperp,nnode,npar = hf_f.get('i_f').shape
+nnode = 150000 # this is the same lim variable as in the main file
 
 mean_f = np.zeros([nsp,nperp,nperp])
 mean_df = np.zeros([nsp,nperp,nperp])
@@ -54,14 +55,16 @@ for iphi in range(nphi):
   
   i_df_zero_inds = np.where(np.einsum('ijk -> j',i_df) == 0)
   i_df_zero_inds = list(i_df_zero_inds[0])
-
+   
   e_inds = list(np.arange(nnode))
   for e in e_df_zero_inds:
-    e_inds.remove(e) 
+    if e < nnode:
+      e_inds.remove(e) 
   
   i_inds = list(np.arange(nnode))
   for i in i_df_zero_inds:
-    i_inds.remove(i) 
+    if i < nnode:
+      i_inds.remove(i) 
  
   # remove them
   i_f = i_f[:,i_inds,:]
