@@ -134,12 +134,12 @@ def load_data_hdf(iphi):
     zvars.std_df = np.concatenate((zvars.std_df,zvars.std_df),axis=0)  
     zvars.std_fdf = np.concatenate((zvars.std_fdf,zvars.std_fdf),axis=0)
   
-  zvars.mean_f = torch.from_numpy(zvars.mean_f).to(device).float()
-  zvars.mean_df = torch.from_numpy(zvars.mean_df).to(device).float()
-  zvars.mean_fdf = torch.from_numpy(zvars.mean_fdf).to(device).float()
-  zvars.std_f = torch.from_numpy(zvars.std_f).to(device).float()
-  zvars.std_df = torch.from_numpy(zvars.std_df).to(device).float()
-  zvars.std_fdf = torch.from_numpy(zvars.std_fdf).to(device).float()
+  zvars.mean_f = torch.from_numpy(zvars.mean_f).to(device).double()
+  zvars.mean_df = torch.from_numpy(zvars.mean_df).to(device).double()
+  zvars.mean_fdf = torch.from_numpy(zvars.mean_fdf).to(device).double()
+  zvars.std_f = torch.from_numpy(zvars.std_f).to(device).double()
+  zvars.std_df = torch.from_numpy(zvars.std_df).to(device).double()
+  zvars.std_fdf = torch.from_numpy(zvars.std_fdf).to(device).double()
        
   return f,df,lim,zero_df_inds,zvars,cons
 
@@ -171,10 +171,10 @@ class conservation_variables():
 class DistFuncDataset(Dataset):
 
     def __init__(self, f_array, df_array, temp_array, vol_array):
-        self.data = torch.from_numpy(f_array).float()
-        self.target = torch.from_numpy(df_array).float()
-        self.temp = torch.from_numpy(temp_array).float()
-        self.vol = torch.from_numpy(vol_array).float()
+        self.data = torch.from_numpy(f_array).double()
+        self.target = torch.from_numpy(df_array).double()
+        self.temp = torch.from_numpy(temp_array).double()
+        self.vol = torch.from_numpy(vol_array).double()
         
     def __len__(self):
         return len(self.data)
@@ -266,7 +266,7 @@ def split_data(f,df,cons,num_nodes,bad_inds):
 # same procedure as col_f_convergence_eval
 def check_properties_each(f_slice, cons, temp, vol, sp):
     
-    f_slice = f_slice.float()
+    f_slice = f_slice.double()
        
     if len(f_slice.shape) == 2:
       nperp, npar = f_slice.shape
@@ -278,23 +278,26 @@ def check_properties_each(f_slice, cons, temp, vol, sp):
     
     vpar = np.linspace(-cons.f0_nvp,cons.f0_nvp,2*cons.f0_nvp+1)*cons.f0_dvp
     vperp = np.linspace(0,cons.f0_nmu,cons.f0_nmu+1)*cons.f0_dsmu
+    vperp1 = vperp.copy()
+    vperp1[0] = vperp1[1]/3. #f0_mu0_factor
     
     
 #     print('vth',vth*torch.from_numpy(cons.f0_dsmu))
 #     print('vpar',torch.from_numpy(vpar)*vth[0])
 #     print('vperp',torch.from_numpy(vperp)*vth[0])
     
-    vpar = torch.tensor(vpar).float().to(device)
-    vperp = torch.tensor(vperp).float().to(device)
+    vpar = torch.tensor(vpar).double().to(device)
+    vperp = torch.tensor(vperp).double().to(device)
+    vperp1 = torch.tensor(vperp1).double().to(device)
         
     mass = cons.ptl_mass[sp]
     conv_factor_notemp = 1/np.sqrt((2*np.pi*cons.sml_ev2j/mass)**3)
     temp_factor = 1/torch.sqrt(temp)
     
-    smu_n = cons.f0_dsmu/3 # smu_n = f0_dsmu/f0_mu0_factor, f0_mu0_factor = 3
-    f_slice_norm = torch.einsum('ijk,i -> ijk',f_slice,temp_factor)*conv_factor_notemp/smu_n
+    #smu_n = cons.f0_dsmu/3 # smu_n = f0_dsmu/f0_mu0_factor, f0_mu0_factor = 3
+    f_slice_norm = torch.einsum('ijk,i,j -> ijk',f_slice,temp_factor,1./vperp1)*conv_factor_notemp
       
-    ones_tensor = torch.ones(nbatch,nperp,npar).float().to(device)
+    ones_tensor = torch.ones(nbatch,nperp,npar).double().to(device)
       
     vol_tensor = torch.einsum('ijk,ij -> ijk',ones_tensor,vol)
     vperp_tensor = torch.einsum('ijk,i,j -> ijk',ones_tensor,vth,vperp)
@@ -317,8 +320,8 @@ def check_properties_each(f_slice, cons, temp, vol, sp):
 # computes more useful quantities as in col_f_core_m after the calls to col_f_convergence_eval 
 def check_properties_main(f,df,temp,vol,cons):
   
-  masse = torch.from_numpy(np.array([cons.ptl_mass[0]])).to(device).float()
-  massi = torch.from_numpy(np.array([cons.ptl_mass[1]])).to(device).float()
+  masse = torch.from_numpy(np.array([cons.ptl_mass[0]])).to(device).double()
+  massi = torch.from_numpy(np.array([cons.ptl_mass[1]])).to(device).double()
   
   #print('df')
   dne,dpe,dwe = check_properties_each(df[:,0],cons,temp[:,0],vol[:,:,0],0)
