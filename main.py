@@ -47,8 +47,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 """# choose network"""
 
-net = Unet().to(device)
-#net = ReSeg().to(device)
+#net = Unet().to(device)
+net = ReSeg().to(device)
 #net = StackedRecurrentHourglass().to(device)
 
 #print(sum(p.numel() for p in net.parameters() if p.requires_grad))
@@ -388,7 +388,7 @@ def train(trainloader,valloader,sp_flag,epoch,end,zvars,cons):
         else:
             optimizer_e.zero_grad()
 
-        outputs = net(data)
+        outputs = net(data.float()).double()
         outputs = outputs.to(device)
         
         nbatch = len(data)     
@@ -568,7 +568,7 @@ def test(f_test,df_test,temp_test,vol_test):
 
             data, targets, temp, vol = data.to(device), targets.to(device), temp.to(device), vol.to(device)
           
-            outputs = net(data)
+            outputs = net(data.float()).double()
             outputs = outputs.to(device)   
             
             nbatch = len(data)     
