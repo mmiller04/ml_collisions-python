@@ -505,7 +505,7 @@ def validate(valloader,cons,zvars):
       
       data, targets, temp, vol = data.to(device), targets.to(device), temp.to(device), vol.to(device)
       
-      outputs = net(data)
+      outputs = net(data.float()).double()
       outputs = outputs.to(device)
             
       nbatch = len(data)     
